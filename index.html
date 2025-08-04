@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>Ma Marque 3D</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="style.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1 id="brand">Ma Marque</h1>
+    <nav>
+      <ul>
+        <li><a href="#" onclick="switchLanguage('fr')">Français</a></li>
+        <li><a href="#" onclick="switchLanguage('en')">English</a></li>
+        <li><a href="#shop" data-i18n="shop">Boutique</a></li>
+        <li><a href="#custom" data-i18n="custom">Personnaliser</a></li>
+      </ul>
+    </nav>
+  </header>
+  <main>
+    <section class="hero">
+      <h2 data-i18n="welcome">Bienvenue sur notre boutique 3D</h2>
+      <p data-i18n="description">Découvrez notre collection et personnalisez vos vêtements en 3D !</p>
+    </section>
+    <section id="shop" class="products">
+      <h3 data-i18n="our_products">Nos Produits</h3>
+      <div class="product-grid">
+        <div class="product">
+          <img src="assets/images/tshirt1.png" alt="T-shirt blanc">
+          <p data-i18n="tshirt_white">T-shirt blanc</p>
+          <button onclick="addToCart('T-shirt blanc')" data-i18n="buy">Acheter</button>
+        </div>
+      </div>
+    </section>
+    <section id="custom">
+      <h3 data-i18n="customize">Personnalisez votre vêtement</h3>
+      <form id="customForm">
+        <label for="color" data-i18n="color">Couleur :</label>
+        <select id="color">
+          <option value="white">Blanc</option>
+          <option value="black">Noir</option>
+        </select>
+        <label for="size" data-i18n="size">Taille :</label>
+        <select id="size">
+          <option>S</option><option>M</option><option>L</option><option>XL</option>
+        </select>
+        <button type="submit" data-i18n="customize">Personnaliser</button>
+      </form>
+    </section>
+  </main>
+  <footer>
+    <p>&copy; 2025 Ma Marque - <span data-i18n="all_rights">Tous droits réservés.</span></p>
+  </footer>
+</body>
+</html>
