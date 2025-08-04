@@ -55,3 +55,80 @@
   </footer>
 </body>
 </html>
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <title>Hoodie 3D + Paiement Stripe</title>
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; background: #eee; }
+    #viewer { width: 600px; height: 600px; display: block; margin: 20px auto; background: #ccc; }
+    #controls { text-align: center; margin-bottom: 30px; }
+  </style>
+</head>
+<body>
+  <h1 style="text-align:center;">Personnalise ton Hoodie 3D</h1>
+  <div id="controls">
+    <label>Couleur : <input type="color" id="colorPicker" value="#ffffff"/></label>
+    <button id="buyBtn">Acheter</button>
+  </div>
+  <canvas id="viewer"></canvas>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.152.2/examples/js/loaders/GLTFLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.152.2/examples/js/controls/OrbitControls.js"></script>
+
+  <script>
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, 600/600, 0.1, 1000);
+    const renderer = new THREE.WebGLRenderer({canvas: document.getElementById('viewer'), alpha:true});
+    renderer.setSize(600, 600);
+
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    camera.position.z = 3;
+    controls.update();
+
+    const light = new THREE.DirectionalLight(0xffffff, 1);
+    light.position.set(5,5,5);
+    scene.add(light);
+    scene.add(new THREE.AmbientLight(0x404040));
+
+    let hoodie;
+
+    const loader = new THREE.GLTFLoader();
+    // Modèle hoodie 3D (exemple gratuit)
+    loader.load('https://threejs.org/examples/models/gltf/Horse.glb', function(gltf) {
+      hoodie = gltf.scene;
+      hoodie.scale.set(1,1,1);
+      scene.add(hoodie);
+      animate();
+    }, undefined, function(error) {
+      console.error('Erreur chargement 3D:', error);
+    });
+
+    function animate() {
+      requestAnimationFrame(animate);
+      if(hoodie) hoodie.rotation.y += 0.005;
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    document.getElementById('colorPicker').addEventListener('input', function(e){
+      if(hoodie){
+        hoodie.traverse((child) => {
+          if(child.isMesh){
+            child.material.color.set(e.target.value);
+          }
+        });
+      }
+    });
+
+    document.getElementById('buyBtn').addEventListener('click', function(){
+      // Lien test Stripe Checkout à remplacer par ton lien réel
+      window.location.href = 'https://buy.stripe.com/test_4gw7vP6Gm3gIdmI3cc';
+    });
+  </script>
+</body>
+</html>
+
