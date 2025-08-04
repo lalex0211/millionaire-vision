@@ -1,4 +1,4 @@
-body {
+ebody {
   margin: 0;
   font-family: 'Segoe UI', sans-serif;
   background: linear-gradient(to right, #e0eafc, #cfdef3);
@@ -30,7 +30,7 @@ nav ul {
 }
 .product {
   margin: 20px;
-  background: white;
+  background: black;
   padding: 15px;
   border-radius: 12px;
   box-shadow: 0 4px 6px rgba(0,0,0,0.1);
