@@ -1,4 +1,4 @@
-# 👕 Ma Marque - Boutique 3D en ligne
+e# 👕 Ma Marque - Boutique 3D en ligne
 
 Bienvenue sur le site officiel de notre marque de vêtements.  
 💡 Design 3D moderne, personnalisation, achat simple, support français/anglais.
@@ -17,7 +17,7 @@ Bienvenue sur le site officiel de notre marque de vêtements.
 Une fois publié via GitHub Pages, le site sera visible ici :
 
 
-> Remplace `lalex9211` par ton nom GitHub
+> Remplace `millionaire vision` par ton nom GitHub
 
 ---
 
