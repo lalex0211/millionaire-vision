@@ -1,0 +1,259 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  GOLD STRUCTURE 15M — Structure de marché pure : BOS / CHoCH / HH-HL-LH-LL
+//  OR (XAUUSD) — 15 minutes — Graphique PROPRE, panneau clair dans le coin
+//
+//  Ce que le bot affiche (et rien d'autre) :
+//   • HH (Higher High)  = sommet plus haut   → force haussière
+//   • HL (Higher Low)   = creux plus haut    → force haussière
+//   • LH (Lower High)   = sommet plus bas    → force baissière
+//   • LL (Lower Low)    = creux plus bas     → force baissière
+//   • BOS   (Break of Structure)   = cassure DANS le sens de la tendance
+//                                    → la tendance CONTINUE
+//   • CHoCH (Change of Character)  = cassure CONTRE la tendance
+//                                    → la tendance CHANGE
+//   Seuls les DERNIERS BOS/CHoCH valides restent affichés (pas de fouillis).
+//
+//  Le PANNEAU dans le coin te dit en permanence :
+//   → STRUCTURE : HAUSSIER ↑ ou BAISSIER ↓
+//   → le dernier événement (BOS/CHoCH) et le dernier swing
+//   → le niveau de retest en attente
+//
+//  ENTRÉE : après un BOS ou un CHoCH, le bot attend que le prix revienne
+//  RETESTER le niveau cassé et le rejette → ACHAT si structure haussière,
+//  VENTE si structure baissière. Jamais contre la structure.
+//
+//  Gestion : SL 1,5 × ATR, TP 2R, Break-Even +1R, trailing ATR,
+//  risque 1 %, max 3 trades/jour, coupe-circuit -3 %/jour.
+// ═══════════════════════════════════════════════════════════════════════════
+
+strategy("GOLD STRUCTURE 15M — BOS / CHoCH",
+     shorttitle = "GOLD-STRUCT",
+     overlay = true,
+     initial_capital = 10000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 0.5,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_labels_count = 500,
+     max_lines_count = 500,
+     max_bars_back = 500)
+
+// ─────────────────────────── PARAMÈTRES ────────────────────────────────────
+grpStruct = "① Structure de marché"
+grpEntry  = "② Entrée sur retest"
+grpRisk   = "③ Gestion du risque"
+grpGuard  = "④ Protections"
+
+pivLen    = input.int(5, "Sensibilité des swings (pivots)", minval = 2, maxval = 15, group = grpStruct, tooltip = "Nombre de bougies de chaque côté pour valider un sommet/creux. 5 = équilibré en 15m.")
+maxKeep   = input.int(3, "Nombre de BOS/CHoCH affichés", minval = 1, maxval = 8, group = grpStruct, tooltip = "Seules les X dernières cassures restent sur le graphique. Le reste est effacé automatiquement.")
+maxSwings = input.int(12, "Nombre d'étiquettes HH/HL/LH/LL affichées", minval = 4, maxval = 30, group = grpStruct)
+
+retestVal = input.int(24, "Validité du retest (bougies après la cassure)", minval = 8, maxval = 96, group = grpEntry, tooltip = "24 bougies de 15m = 6 heures pour que le prix revienne retester le niveau cassé.")
+
+riskPct   = input.float(1.0, "Risque par trade (% du capital)", minval = 0.1, maxval = 3, step = 0.1, group = grpRisk)
+slMult    = input.float(1.5, "Stop Loss (× ATR)", minval = 0.5, step = 0.1, group = grpRisk)
+rrRatio   = input.float(2.0, "Ratio Take Profit (R:R)", minval = 1.0, step = 0.25, group = grpRisk)
+trailMult = input.float(2.0, "Trailing stop (× ATR) après +1R", minval = 0.5, step = 0.1, group = grpRisk)
+
+maxPerDay  = input.int(3,     "Max trades par jour", minval = 1, maxval = 8, group = grpGuard)
+maxDayLoss = input.float(3.0, "Perte journalière max (%)", minval = 0.5, step = 0.5, group = grpGuard)
+useSess    = input.bool(true, "Trader uniquement Londres + New York", group = grpGuard)
+sessStr    = input.session("0700-2030", "Plage horaire (UTC)", group = grpGuard)
+allowLong  = input.bool(true, "Autoriser les ACHATS", group = grpGuard)
+allowShort = input.bool(true, "Autoriser les VENTES", group = grpGuard)
+
+// ─────────────────────────── OUTILS ────────────────────────────────────────
+atrVal = ta.atr(14)
+inSession = not useSess or not na(time(timeframe.period, sessStr, "UTC"))
+
+newDay = ta.change(time("D")) != 0
+var int   tradesToday    = 0
+var float dayStartEquity = strategy.equity
+if newDay
+    tradesToday    := 0
+    dayStartEquity := strategy.equity
+
+dailyLossHit = strategy.equity <= dayStartEquity * (1 - maxDayLoss / 100)
+canTrade     = tradesToday < maxPerDay and not dailyLossHit and strategy.position_size == 0
+
+// ═══════════════════ LA STRUCTURE : SWINGS HH/HL/LH/LL ══════════════════════
+ph = ta.pivothigh(high, pivLen, pivLen)
+plv = ta.pivotlow(low, pivLen, pivLen)
+
+var float prevPH   = na      // sommet précédent (pour comparer HH vs LH)
+var float prevPL   = na      // creux précédent (pour comparer HL vs LL)
+var float lastSH   = na      // dernier sommet non cassé
+var int   lastSHbar = na
+var float lastSL   = na      // dernier creux non cassé
+var int   lastSLbar = na
+var int   trend    = 0       // 1 = haussier, -1 = baissier, 0 = pas encore établi
+var string lastSwingTxt = "—"
+var string lastEventTxt = "—"
+var int    lastEventBar = na
+
+var array<label> swingLabs   = array.new<label>()
+var array<line>  structLines = array.new<line>()
+var array<label> structLabs  = array.new<label>()
+
+addSwingLabel(int x, float y, string txt, bool onTop, color col) =>
+    lb = label.new(x, y, txt, style = onTop ? label.style_label_down : label.style_label_up, color = color.new(color.black, 100), textcolor = col, size = size.small)
+    array.push(swingLabs, lb)
+    if array.size(swingLabs) > maxSwings
+        label.delete(array.shift(swingLabs))
+
+// Nouveau SOMMET confirmé → HH ou LH
+if not na(ph)
+    txtH = na(prevPH) ? "H" : ph > prevPH ? "HH" : "LH"
+    colH = txtH == "HH" ? color.new(color.green, 0) : txtH == "LH" ? color.new(color.red, 0) : color.new(color.gray, 30)
+    addSwingLabel(bar_index - pivLen, ph, txtH, true, colH)
+    prevPH   := ph
+    lastSH   := ph
+    lastSHbar := bar_index - pivLen
+    lastSwingTxt := txtH
+
+// Nouveau CREUX confirmé → HL ou LL
+if not na(plv)
+    txtL = na(prevPL) ? "L" : plv > prevPL ? "HL" : "LL"
+    colL = txtL == "HL" ? color.new(color.green, 0) : txtL == "LL" ? color.new(color.red, 0) : color.new(color.gray, 30)
+    addSwingLabel(bar_index - pivLen, plv, txtL, false, colL)
+    prevPL   := plv
+    lastSL   := plv
+    lastSLbar := bar_index - pivLen
+    lastSwingTxt := txtL
+
+// ═══════════════════ BOS / CHoCH : les cassures de structure ════════════════
+var float retestLvlL = na   // niveau cassé à la hausse → retest pour ACHAT
+var int   retestLset = na
+var float retestLvlS = na   // niveau cassé à la baisse → retest pour VENTE
+var int   retestSset = na
+
+addStructMark(int x1, float y, string evt, bool up) =>
+    col = up ? color.new(color.green, 0) : color.new(color.red, 0)
+    ln = line.new(x1, y, bar_index, y, color = col, width = 2, style = evt == "BOS" ? line.style_solid : line.style_dashed)
+    lb = label.new(bar_index, y, evt + (up ? " ↑" : " ↓"), style = up ? label.style_label_down : label.style_label_up, color = color.new(up ? color.green : color.red, evt == "BOS" ? 60 : 20), textcolor = color.white, size = size.small)
+    array.push(structLines, ln)
+    array.push(structLabs, lb)
+    if array.size(structLines) > maxKeep
+        line.delete(array.shift(structLines))
+        label.delete(array.shift(structLabs))
+
+// Cassure d'un SOMMET (clôture au-dessus)
+if not na(lastSH) and close > lastSH
+    evt = trend == 1 ? "BOS" : "CHoCH"
+    addStructMark(lastSHbar, lastSH, evt, true)
+    trend        := 1
+    lastEventTxt := evt + " ↑"
+    lastEventBar := bar_index
+    retestLvlL   := lastSH
+    retestLset   := bar_index
+    retestLvlS   := na
+    lastSH       := na
+
+// Cassure d'un CREUX (clôture en dessous)
+if not na(lastSL) and close < lastSL
+    evt = trend == -1 ? "BOS" : "CHoCH"
+    addStructMark(lastSLbar, lastSL, evt, false)
+    trend        := -1
+    lastEventTxt := evt + " ↓"
+    lastEventBar := bar_index
+    retestLvlS   := lastSL
+    retestSset   := bar_index
+    retestLvlL   := na
+    lastSL       := na
+
+// ═══════════════════ RETEST DU NIVEAU CASSÉ = L'ENTRÉE ══════════════════════
+// Expiration / invalidation
+if not na(retestLvlL) and (bar_index - retestLset > retestVal or close < retestLvlL - atrVal)
+    retestLvlL := na
+if not na(retestLvlS) and (bar_index - retestSset > retestVal or close > retestLvlS + atrVal)
+    retestLvlS := na
+
+// Retest confirmé : mèche sur le niveau + clôture qui rejette dans le sens
+longSig  = allowLong  and canTrade and inSession and trend == 1  and not na(retestLvlL) and low <= retestLvlL and close > retestLvlL and close > open
+shortSig = allowShort and canTrade and inSession and trend == -1 and not na(retestLvlS) and high >= retestLvlS and close < retestLvlS and close < open
+
+plot(retestLvlL, "Retest ACHAT en attente", color = color.new(color.green, 40), style = plot.style_linebr, linewidth = 2)
+plot(retestLvlS, "Retest VENTE en attente", color = color.new(color.red, 40),   style = plot.style_linebr, linewidth = 2)
+
+// ─────────────────────── GESTION DE POSITION ────────────────────────────────
+var float stopPrice = na
+var float tpPrice   = na
+var float riskDist  = na
+
+calcQty(slDistance) =>
+    math.max((strategy.equity * riskPct / 100) / slDistance, 0.01)
+
+if longSig
+    riskDist  := atrVal * slMult
+    stopPrice := close - riskDist
+    tpPrice   := close + riskDist * rrRatio
+    q = calcQty(riskDist)
+    strategy.entry("ACHAT", strategy.long, qty = q, alert_message = '{"bot":"GOLD_STRUCT","action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp":' + str.tostring(tpPrice, format.mintick) + '}')
+    tradesToday += 1
+    retestLvlL := na
+
+if shortSig
+    riskDist  := atrVal * slMult
+    stopPrice := close + riskDist
+    tpPrice   := close - riskDist * rrRatio
+    q = calcQty(riskDist)
+    strategy.entry("VENTE", strategy.short, qty = q, alert_message = '{"bot":"GOLD_STRUCT","action":"sell","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp":' + str.tostring(tpPrice, format.mintick) + '}')
+    tradesToday += 1
+    retestLvlS := na
+
+// Break-Even à +1R puis trailing ATR
+if strategy.position_size > 0
+    entryP = strategy.position_avg_price
+    if high >= entryP + riskDist
+        stopPrice := math.max(stopPrice, entryP + syminfo.mintick * 10)
+        stopPrice := math.max(stopPrice, close - atrVal * trailMult)
+
+if strategy.position_size < 0
+    entryP = strategy.position_avg_price
+    if low <= entryP - riskDist
+        stopPrice := math.min(stopPrice, entryP - syminfo.mintick * 10)
+        stopPrice := math.min(stopPrice, close + atrVal * trailMult)
+
+if strategy.position_size > 0
+    strategy.exit("SORTIE-A", from_entry = "ACHAT", stop = stopPrice, limit = tpPrice, alert_message = '{"bot":"GOLD_STRUCT","action":"close_buy","symbol":"' + syminfo.ticker + '"}')
+if strategy.position_size < 0
+    strategy.exit("SORTIE-V", from_entry = "VENTE", stop = stopPrice, limit = tpPrice, alert_message = '{"bot":"GOLD_STRUCT","action":"close_sell","symbol":"' + syminfo.ticker + '"}')
+
+// ─────────────────────────── SIGNAUX VISUELS ────────────────────────────────
+plotshape(longSig,  "ACHAT (retest structure)", shape.triangleup,   location.belowbar, color.new(color.green, 0), size = size.normal, text = "ACHAT")
+plotshape(shortSig, "VENTE (retest structure)", shape.triangledown, location.abovebar, color.new(color.red, 0),   size = size.normal, text = "VENTE")
+
+plot(strategy.position_size != 0 ? stopPrice : na, "Stop Loss",   color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size != 0 ? tpPrice   : na, "Take Profit", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
+
+bgcolor(dailyLossHit ? color.new(color.red, 88) : na, title = "Coupe-circuit journalier")
+
+// ═══════════════════ LE PANNEAU DANS LE COIN ════════════════════════════════
+var table dash = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 10), border_width = 1, border_color = color.new(color.gray, 55))
+if barstate.islast
+    structTxt = trend == 1 ? "HAUSSIER ↑" : trend == -1 ? "BAISSIER ↓" : "EN ATTENTE"
+    structCol = trend == 1 ? color.green : trend == -1 ? color.red : color.gray
+    agoTxt    = na(lastEventBar) ? "" : "  (il y a " + str.tostring(bar_index - lastEventBar) + " bougies)"
+    retestTxt = not na(retestLvlL) ? "ACHAT sur " + str.tostring(retestLvlL, format.mintick) : not na(retestLvlS) ? "VENTE sur " + str.tostring(retestLvlS, format.mintick) : "aucun — on attend une cassure"
+    retestCol = not na(retestLvlL) ? color.green : not na(retestLvlS) ? color.red : color.gray
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+    table.cell(dash, 0, 0, "GOLD STRUCTURE 15M", text_color = color.yellow, text_size = size.small)
+    table.cell(dash, 1, 0, structTxt, text_color = structCol, text_size = size.normal)
+    table.cell(dash, 0, 1, "Dernier événement", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 1, lastEventTxt + agoTxt, text_color = str.contains(lastEventTxt, "↑") ? color.green : str.contains(lastEventTxt, "↓") ? color.red : color.gray, text_size = size.tiny)
+    table.cell(dash, 0, 2, "Dernier swing", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 2, lastSwingTxt, text_color = lastSwingTxt == "HH" or lastSwingTxt == "HL" ? color.green : lastSwingTxt == "LH" or lastSwingTxt == "LL" ? color.red : color.gray, text_size = size.small)
+    table.cell(dash, 0, 3, "Retest en attente", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 3, retestTxt, text_color = retestCol, text_size = size.tiny)
+    table.cell(dash, 0, 4, "Réussite / PF", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 4, str.tostring(winRate, "#.#") + " % / " + str.tostring(pf, "#.##"), text_color = pf >= 1.3 ? color.green : color.orange, text_size = size.tiny)
+    table.cell(dash, 0, 5, "Trades aujourd'hui", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 5, str.tostring(tradesToday) + " / " + str.tostring(maxPerDay), text_color = tradesToday >= maxPerDay ? color.red : color.white, text_size = size.tiny)
+    table.cell(dash, 0, 6, "Position", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 6, strategy.position_size > 0 ? "ACHAT en cours" : strategy.position_size < 0 ? "VENTE en cours" : "aucune", text_color = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray, text_size = size.tiny)
