@@ -1,0 +1,279 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  GOLD SMC 15M — Order Blocks + Fair Value Gaps pour l'OR (XAUUSD)
+//  Timeframe : 15 minutes | Le bot détecte les zones institutionnelles
+//  et donne ACHAT ou VENTE quand le prix les respecte.
+//
+//  Concepts (Smart Money) :
+//   • ORDER BLOCK haussier  = la dernière bougie baissière avant une forte
+//     impulsion haussière (displacement). C'est là que les institutions
+//     ont acheté → si le prix y revient, on cherche un ACHAT.
+//   • ORDER BLOCK baissier  = miroir (dernière bougie haussière avant
+//     une chute violente).
+//   • FVG (Fair Value Gap)  = trou de liquidité : le bas de la bougie
+//     actuelle est au-dessus du haut d'il y a 2 bougies (ou l'inverse).
+//     Le prix revient souvent "remplir" ce trou avant de repartir.
+//
+//  Signal :
+//   1. Le bot dessine les zones OB (boîtes pleines) et FVG (boîtes claires)
+//   2. Le prix REVIENT dans la zone (mèche qui tape dedans)
+//   3. CONFIRMATION : la bougie rejette la zone et clôture au-dessus
+//      (achat) / en dessous (vente) → flèche ACHAT ou VENTE
+//   4. Zone traversée de part en part = zone morte (grisée), plus de signal
+//
+//  Gestion : SL derrière la zone, TP = 2R, Break-Even à +1R, trailing ATR,
+//  risque 1 %/trade, max trades/jour, coupe-circuit journalier.
+// ═══════════════════════════════════════════════════════════════════════════
+
+strategy("GOLD SMC 15M — Order Blocks + FVG",
+     shorttitle = "GOLD-SMC",
+     overlay = true,
+     initial_capital = 10000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 0.5,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_boxes_count = 500,
+     max_bars_back = 500)
+
+// ─────────────────────────── PARAMÈTRES ────────────────────────────────────
+grpZones = "① Détection des zones (OB + FVG)"
+grpBias  = "② Sens du marché (bias)"
+grpRisk  = "③ Gestion du risque"
+grpGuard = "④ Protections"
+grpSess  = "⑤ Sessions (UTC)"
+grpDir   = "⑥ Direction"
+
+dispMult = input.float(1.2, "Force de l'impulsion pour valider un OB (× ATR)", minval = 0.5, step = 0.1, group = grpZones, tooltip = "Plus c'est haut, plus les Order Blocks retenus sont de qualité (mais plus rares).")
+fvgMin   = input.float(0.3, "Taille minimum d'un FVG (× ATR)", minval = 0.1, step = 0.05, group = grpZones, tooltip = "Ignore les micro-gaps sans intérêt.")
+maxZones = input.int(5, "Nombre max de zones actives par type", minval = 2, maxval = 10, group = grpZones)
+useOB    = input.bool(true, "Utiliser les ORDER BLOCKS", group = grpZones)
+useFVG   = input.bool(true, "Utiliser les FVG", group = grpZones)
+
+useBias  = input.bool(true, "Filtre de tendance (EMA 200 en 15m + 1H)", group = grpBias, tooltip = "ACHAT seulement si le marché est haussier, VENTE seulement s'il est baissier. Fortement recommandé.")
+htfTf    = input.timeframe("60", "Unité de temps de confirmation", group = grpBias)
+
+riskPct   = input.float(1.0, "Risque par trade (% du capital)", minval = 0.1, maxval = 5, step = 0.1, group = grpRisk)
+atrLen    = input.int(14,    "Longueur ATR", minval = 2, group = grpRisk)
+slPad     = input.float(0.5, "Marge du Stop Loss derrière la zone (× ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+rrRatio   = input.float(2.0, "Ratio Take Profit (R:R)", minval = 1.0, step = 0.25, group = grpRisk)
+useBE     = input.bool(true, "Break-Even automatique à +1R", group = grpRisk)
+useTrail  = input.bool(true, "Trailing stop ATR après +1R",  group = grpRisk)
+trailMult = input.float(2.0, "Trailing (× ATR)", minval = 0.5, step = 0.1, group = grpRisk)
+
+maxPerDay  = input.int(3,     "Max trades par jour", minval = 1, maxval = 10, group = grpGuard)
+maxDayLoss = input.float(3.0, "Perte journalière max (%) — coupe-circuit", minval = 0.5, step = 0.5, group = grpGuard)
+
+useSess = input.bool(true, "Trader uniquement Londres + New York", group = grpSess)
+sessStr = input.session("0700-2030", "Plage horaire (UTC)", group = grpSess)
+
+allowLong  = input.bool(true, "Autoriser les ACHATS", group = grpDir)
+allowShort = input.bool(true, "Autoriser les VENTES", group = grpDir)
+
+// ─────────────────────────── INDICATEURS ───────────────────────────────────
+atrVal = ta.atr(atrLen)
+emaB   = ta.ema(close, 200)
+[htfC, htfE] = request.security(syminfo.tickerid, htfTf, [close, ta.ema(close, 200)], lookahead = barmerge.lookahead_off)
+
+biasBull = not useBias or (close > emaB and htfC > htfE)
+biasBear = not useBias or (close < emaB and htfC < htfE)
+
+inSession = not useSess or not na(time(timeframe.period, sessStr, "UTC"))
+
+// ─────────────────────── PROTECTIONS JOURNALIÈRES ──────────────────────────
+newDay = ta.change(time("D")) != 0
+var int   tradesToday    = 0
+var float dayStartEquity = strategy.equity
+if newDay
+    tradesToday    := 0
+    dayStartEquity := strategy.equity
+
+dailyLossHit = strategy.equity <= dayStartEquity * (1 - maxDayLoss / 100)
+canTrade     = tradesToday < maxPerDay and not dailyLossHit and strategy.position_size == 0
+
+// ─────────────────────── STOCKAGE DES ZONES ─────────────────────────────────
+var array<box> bullOBs  = array.new<box>()
+var array<box> bearOBs  = array.new<box>()
+var array<box> bullFVGs = array.new<box>()
+var array<box> bearFVGs = array.new<box>()
+
+// Ajoute une zone et supprime la plus ancienne si on dépasse la limite
+addZone(array<box> arr, int leftBar, float top, float bottom, color bg, color bord, string txt, color txtCol) =>
+    b = box.new(leftBar, top, bar_index, bottom, border_color = bord, bgcolor = bg, extend = extend.right, text = txt, text_color = txtCol, text_size = size.tiny, text_halign = text.align_left)
+    array.push(arr, b)
+    if array.size(arr) > maxZones
+        box.delete(array.shift(arr))
+
+// Vérifie les zones HAUSSIÈRES : invalide celles cassées, détecte un retest
+// confirmé (mèche dans la zone + clôture haussière au-dessus de la zone).
+checkBullZones(array<box> arr, bool enabled) =>
+    sig = false
+    zBottom = float(na)
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            b   = array.get(arr, i)
+            t   = box.get_top(b)
+            btm = box.get_bottom(b)
+            if close < btm
+                // Zone traversée → morte (grisée, figée)
+                box.set_extend(b, extend.none)
+                box.set_right(b, bar_index)
+                box.set_bgcolor(b, color.new(color.gray, 92))
+                box.set_border_color(b, color.new(color.gray, 70))
+                array.remove(arr, i)
+            else if enabled and not sig and low <= t and close > t and close > open
+                // RESPECT DE LA ZONE : mèche dedans + rejet haussier
+                sig     := true
+                zBottom := btm
+                box.set_extend(b, extend.none)
+                box.set_right(b, bar_index)
+                array.remove(arr, i)
+    [sig, zBottom]
+
+// Miroir pour les zones BAISSIÈRES
+checkBearZones(array<box> arr, bool enabled) =>
+    sig = false
+    zTop = float(na)
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            b   = array.get(arr, i)
+            t   = box.get_top(b)
+            btm = box.get_bottom(b)
+            if close > t
+                box.set_extend(b, extend.none)
+                box.set_right(b, bar_index)
+                box.set_bgcolor(b, color.new(color.gray, 92))
+                box.set_border_color(b, color.new(color.gray, 70))
+                array.remove(arr, i)
+            else if enabled and not sig and high >= btm and close < btm and close < open
+                sig  := true
+                zTop := t
+                box.set_extend(b, extend.none)
+                box.set_right(b, bar_index)
+                array.remove(arr, i)
+    [sig, zTop]
+
+// ─────────── 1) D'ABORD : retests sur les zones existantes ──────────────────
+okToLong  = allowLong  and canTrade and inSession and biasBull
+okToShort = allowShort and canTrade and inSession and biasBear
+
+[obLongSig,  obLongBottom]  = checkBullZones(bullOBs,  okToLong)
+[fvgLongSig, fvgLongBottom] = checkBullZones(bullFVGs, okToLong and not obLongSig)
+[obShortSig,  obShortTop]  = checkBearZones(bearOBs,  okToShort)
+[fvgShortSig, fvgShortTop] = checkBearZones(bearFVGs, okToShort and not obShortSig)
+
+longSig  = obLongSig or fvgLongSig
+shortSig = obShortSig or fvgShortSig
+longZoneBottom = obLongSig ? obLongBottom : fvgLongBottom
+shortZoneTop   = obShortSig ? obShortTop : fvgShortTop
+
+// ─────────── 2) ENSUITE : détection des nouvelles zones ─────────────────────
+// ORDER BLOCK haussier : bougie baissière suivie d'une impulsion haussière
+// qui dépasse son haut avec un corps > dispMult × ATR
+bullImpulse = close > open and (close - open) >= dispMult * atrVal and close > high[1]
+bearImpulse = close < open and (open - close) >= dispMult * atrVal and close < low[1]
+
+newBullOB = useOB and bullImpulse and close[1] < open[1]
+newBearOB = useOB and bearImpulse and close[1] > open[1]
+
+if newBullOB
+    addZone(bullOBs, bar_index - 1, high[1], low[1], color.new(color.green, 82), color.new(color.green, 40), "OB ↑", color.new(color.green, 20))
+if newBearOB
+    addZone(bearOBs, bar_index - 1, high[1], low[1], color.new(color.red, 82), color.new(color.red, 40), "OB ↓", color.new(color.red, 20))
+
+// FVG haussier : le bas actuel est au-dessus du haut d'il y a 2 bougies
+newBullFVG = useFVG and low > high[2] and (low - high[2]) >= fvgMin * atrVal
+newBearFVG = useFVG and high < low[2] and (low[2] - high) >= fvgMin * atrVal
+
+if newBullFVG
+    addZone(bullFVGs, bar_index - 2, low, high[2], color.new(color.teal, 88), color.new(color.teal, 50), "FVG ↑", color.new(color.teal, 20))
+if newBearFVG
+    addZone(bearFVGs, bar_index - 2, low[2], high, color.new(color.orange, 88), color.new(color.orange, 50), "FVG ↓", color.new(color.orange, 20))
+
+// ─────────────────────── GESTION DE POSITION ────────────────────────────────
+var float stopPrice = na
+var float tpPrice   = na
+var float riskDist  = na
+
+calcQty(slDistance) =>
+    riskMoney = strategy.equity * riskPct / 100
+    qty = riskMoney / slDistance
+    math.max(qty, 0.01)
+
+if longSig
+    stopPrice := longZoneBottom - atrVal * slPad
+    riskDist  := close - stopPrice
+    tpPrice   := close + riskDist * rrRatio
+    q = calcQty(riskDist)
+    msgLong = '{"bot":"GOLD_SMC","action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp":' + str.tostring(tpPrice, format.mintick) + ',"risk_pct":' + str.tostring(riskPct) + '}'
+    strategy.entry("ACHAT", strategy.long, qty = q, alert_message = msgLong)
+    tradesToday += 1
+
+if shortSig
+    stopPrice := shortZoneTop + atrVal * slPad
+    riskDist  := stopPrice - close
+    tpPrice   := close - riskDist * rrRatio
+    q = calcQty(riskDist)
+    msgShort = '{"bot":"GOLD_SMC","action":"sell","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp":' + str.tostring(tpPrice, format.mintick) + ',"risk_pct":' + str.tostring(riskPct) + '}'
+    strategy.entry("VENTE", strategy.short, qty = q, alert_message = msgShort)
+    tradesToday += 1
+
+// Break-Even + trailing pendant la position
+if strategy.position_size > 0
+    entryP = strategy.position_avg_price
+    if useBE and high >= entryP + riskDist
+        stopPrice := math.max(stopPrice, entryP + syminfo.mintick * 10)
+    if useTrail and high >= entryP + riskDist
+        stopPrice := math.max(stopPrice, close - atrVal * trailMult)
+
+if strategy.position_size < 0
+    entryP = strategy.position_avg_price
+    if useBE and low <= entryP - riskDist
+        stopPrice := math.min(stopPrice, entryP - syminfo.mintick * 10)
+    if useTrail and low <= entryP - riskDist
+        stopPrice := math.min(stopPrice, close + atrVal * trailMult)
+
+msgCloseLong  = '{"bot":"GOLD_SMC","action":"close_buy","symbol":"' + syminfo.ticker + '"}'
+msgCloseShort = '{"bot":"GOLD_SMC","action":"close_sell","symbol":"' + syminfo.ticker + '"}'
+
+if strategy.position_size > 0
+    strategy.exit("SORTIE-A", from_entry = "ACHAT", stop = stopPrice, limit = tpPrice, alert_message = msgCloseLong)
+if strategy.position_size < 0
+    strategy.exit("SORTIE-V", from_entry = "VENTE", stop = stopPrice, limit = tpPrice, alert_message = msgCloseShort)
+
+// ─────────────────────────── AFFICHAGE ─────────────────────────────────────
+plot(emaB, "EMA 200", color = useBias ? color.new(color.gray, 30) : color.new(color.gray, 85), linewidth = 1)
+
+plotshape(longSig,  "ACHAT (zone respectée)", shape.triangleup,   location.belowbar, color.new(color.green, 0), size = size.small, text = "ACHAT")
+plotshape(shortSig, "VENTE (zone respectée)", shape.triangledown, location.abovebar, color.new(color.red, 0),   size = size.small, text = "VENTE")
+
+plot(strategy.position_size != 0 ? stopPrice : na, "Stop Loss",   color = color.new(color.red, 0),   style = plot.style_linebr)
+plot(strategy.position_size != 0 ? tpPrice   : na, "Take Profit", color = color.new(color.green, 0), style = plot.style_linebr)
+
+bgcolor(dailyLossHit ? color.new(color.red, 88) : na, title = "Coupe-circuit journalier")
+
+// ─────────────────────── TABLEAU DE BORD ───────────────────────────────────
+var table dash = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 20), border_width = 1, border_color = color.new(color.gray, 60))
+if barstate.islast
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+    biasTxt = close > emaB and htfC > htfE ? "ACHAT ↑" : close < emaB and htfC < htfE ? "VENTE ↓" : "NEUTRE — on attend"
+    biasCol = close > emaB and htfC > htfE ? color.green : close < emaB and htfC < htfE ? color.red : color.gray
+    table.cell(dash, 0, 0, "GOLD SMC — OB + FVG", text_color = color.yellow, text_size = size.small)
+    table.cell(dash, 1, 0, "BIAS : " + biasTxt, text_color = biasCol, text_size = size.small)
+    table.cell(dash, 0, 1, "Zones ACHAT actives", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 1, str.tostring(array.size(bullOBs)) + " OB + " + str.tostring(array.size(bullFVGs)) + " FVG", text_color = color.green, text_size = size.tiny)
+    table.cell(dash, 0, 2, "Zones VENTE actives", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 2, str.tostring(array.size(bearOBs)) + " OB + " + str.tostring(array.size(bearFVGs)) + " FVG", text_color = color.red, text_size = size.tiny)
+    table.cell(dash, 0, 3, "Trades fermés", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 3, str.tostring(strategy.closedtrades), text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 0, 4, "Taux de réussite", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 4, str.tostring(winRate, "#.#") + " %", text_color = winRate >= 45 ? color.green : color.orange, text_size = size.tiny)
+    table.cell(dash, 0, 5, "Profit Factor", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 5, str.tostring(pf, "#.##"), text_color = pf >= 1.3 ? color.green : color.orange, text_size = size.tiny)
+    table.cell(dash, 0, 6, "Trades aujourd'hui", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 6, str.tostring(tradesToday) + " / " + str.tostring(maxPerDay), text_color = tradesToday >= maxPerDay ? color.red : color.white, text_size = size.tiny)
