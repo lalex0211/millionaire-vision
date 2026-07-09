@@ -1,0 +1,238 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  GOLD OPEN RETEST 15M — Bot cassure d'ouverture + retest pour l'OR (XAUUSD)
+//  Timeframe : 15 minutes | Achat + Vente | Uniquement aux ouvertures de marché
+//
+//  Logique (setup pro "Opening Range Breakout + Retest") :
+//   1. À l'ouverture de Londres (07h00 UTC) et de New York (13h30 UTC),
+//      le bot trace le RANGE D'OUVERTURE (les 3 premières bougies de 15m)
+//   2. Il attend une CASSURE : une bougie qui CLÔTURE au-dessus (achat)
+//      ou en dessous (vente) du range — pas juste une mèche
+//   3. Il n'entre PAS sur la cassure (piège classique). Il attend le
+//      RETEST : le prix revient toucher le niveau cassé
+//   4. CONFIRMATION : une bougie qui rejette le niveau et clôture dans le
+//      sens de la cassure → ENTRÉE
+//   5. Si le retest n'arrive pas dans le temps imparti, ou si la cassure
+//      échoue, le setup est annulé. Pas de trade forcé.
+//
+//  Gestion : SL sous le retest, TP = 2× le risque, Break-Even à +1R,
+//  trailing ATR, risque 1 %/trade, coupe-circuit journalier.
+// ═══════════════════════════════════════════════════════════════════════════
+
+strategy("GOLD OPEN RETEST 15M — XAUUSD",
+     shorttitle = "GOLD-OR15",
+     overlay = true,
+     initial_capital = 10000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 0.5,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_bars_back = 500)
+
+// ─────────────────────────── PARAMÈTRES ────────────────────────────────────
+grpOpen  = "① Ouvertures de marché (UTC)"
+grpSetup = "② Cassure + Retest"
+grpRisk  = "③ Gestion du risque"
+grpGuard = "④ Protections"
+grpDir   = "⑤ Direction"
+
+useLondon = input.bool(true,  "Trader l'ouverture de LONDRES",  group = grpOpen)
+sessLdn   = input.session("0700-0745", "Range d'ouverture Londres (UTC)",  group = grpOpen, tooltip = "Les 3 premières bougies de 15m après l'ouverture. Le bot trace le haut et le bas de cette zone.")
+useNY     = input.bool(true,  "Trader l'ouverture de NEW YORK", group = grpOpen)
+sessNy    = input.session("1330-1415", "Range d'ouverture New York (UTC)", group = grpOpen)
+
+maxWait   = input.int(16, "Validité du setup (nb de bougies après le range)", minval = 4, maxval = 40, group = grpSetup, tooltip = "16 bougies de 15m = 4 heures. Passé ce délai sans cassure + retest, le setup est annulé.")
+retestTol = input.float(0.25, "Tolérance du retest (× ATR)", minval = 0.05, step = 0.05, group = grpSetup, tooltip = "Distance max entre le prix et le niveau cassé pour valider le retest.")
+failMult  = input.float(1.0,  "Annulation si le prix retraverse de (× ATR)", minval = 0.25, step = 0.25, group = grpSetup, tooltip = "Si après la cassure le prix reclôture de l'autre côté du niveau de plus de X × ATR, la cassure est considérée comme ratée : setup annulé.")
+useTrendF = input.bool(false, "Filtre EMA 200 (trader seulement dans la tendance)", group = grpSetup, tooltip = "Optionnel : n'accepte les achats que si le prix est au-dessus de l'EMA 200, et inversement. Moins de trades, mais plus propres.")
+
+riskPct   = input.float(1.0, "Risque par trade (% du capital)", minval = 0.1, maxval = 5, step = 0.1, group = grpRisk)
+atrLen    = input.int(14,    "Longueur ATR", minval = 2, group = grpRisk)
+slPad     = input.float(0.5, "Marge du Stop Loss (× ATR sous le retest)", minval = 0.1, step = 0.1, group = grpRisk)
+rrRatio   = input.float(2.0, "Ratio Take Profit (R:R)", minval = 1.0, step = 0.25, group = grpRisk)
+useBE     = input.bool(true, "Break-Even automatique à +1R", group = grpRisk)
+useTrail  = input.bool(true, "Trailing stop ATR après +1R",  group = grpRisk)
+trailMult = input.float(2.0, "Trailing (× ATR)", minval = 0.5, step = 0.1, group = grpRisk)
+
+maxPerDay  = input.int(2,     "Max trades par jour", minval = 1, maxval = 6, group = grpGuard, tooltip = "2 par défaut : un par ouverture (Londres + New York).")
+maxDayLoss = input.float(3.0, "Perte journalière max (%) — coupe-circuit", minval = 0.5, step = 0.5, group = grpGuard)
+
+allowLong  = input.bool(true, "Autoriser les ACHATS", group = grpDir)
+allowShort = input.bool(true, "Autoriser les VENTES", group = grpDir)
+
+// ─────────────────────────── INDICATEURS ───────────────────────────────────
+atrVal   = ta.atr(atrLen)
+emaTrend = ta.ema(close, 200)
+
+// ─────────────────────── DÉTECTION DES OUVERTURES ──────────────────────────
+inLdn  = useLondon and not na(time(timeframe.period, sessLdn, "UTC"))
+inNy   = useNY     and not na(time(timeframe.period, sessNy,  "UTC"))
+inOR   = inLdn or inNy
+orStart = inOR and not inOR[1]
+orEnd   = not inOR and inOR[1]
+
+// ─────────────────────── PROTECTIONS JOURNALIÈRES ──────────────────────────
+newDay = ta.change(time("D")) != 0
+var int   tradesToday    = 0
+var float dayStartEquity = strategy.equity
+if newDay
+    tradesToday    := 0
+    dayStartEquity := strategy.equity
+
+dailyLossHit = strategy.equity <= dayStartEquity * (1 - maxDayLoss / 100)
+canTrade     = tradesToday < maxPerDay and not dailyLossHit and strategy.position_size == 0
+
+// ─────────────────────── MACHINE À ÉTATS DU SETUP ───────────────────────────
+// phase : 0 = inactif | 1 = range en construction | 2 = attente cassure
+//         3 = cassé vers le HAUT, attente retest | 4 = cassé vers le BAS, attente retest
+var int   phase    = 0
+var float orHigh   = na
+var float orLow    = na
+var float breakLvl = na
+var int   orEndBar = na
+
+// Nouvelle ouverture : on repart de zéro
+if orStart
+    phase    := 1
+    orHigh   := high
+    orLow    := low
+    breakLvl := na
+
+// Construction du range pendant la fenêtre d'ouverture
+if inOR and phase == 1
+    orHigh := math.max(orHigh, high)
+    orLow  := math.min(orLow, low)
+
+// Fin du range → on attend la cassure
+if orEnd and phase == 1
+    phase    := 2
+    orEndBar := bar_index
+
+// Expiration du setup (trop de temps écoulé sans entrée)
+if phase >= 2 and not na(orEndBar) and (bar_index - orEndBar) > maxWait
+    phase := 0
+
+// Détection de la cassure (CLÔTURE au-delà du niveau, pas une simple mèche)
+if phase == 2
+    if close > orHigh
+        phase    := 3
+        breakLvl := orHigh
+    else if close < orLow
+        phase    := 4
+        breakLvl := orLow
+
+// Cassure ratée → annulation (le prix reclôture franchement de l'autre côté)
+if phase == 3 and close < breakLvl - atrVal * failMult
+    phase := 0
+if phase == 4 and close > breakLvl + atrVal * failMult
+    phase := 0
+
+// ─────────────────────── RETEST + CONFIRMATION ──────────────────────────────
+tol = atrVal * retestTol
+
+trendOkLong  = not useTrendF or close > emaTrend
+trendOkShort = not useTrendF or close < emaTrend
+
+// ACHAT : le prix redescend toucher le niveau cassé (mèche dans la zone),
+// puis la bougie REJETTE et clôture au-dessus du niveau, bougie haussière.
+longRetest  = phase == 3 and low  <= breakLvl + tol and close > breakLvl and close > open
+// VENTE : miroir.
+shortRetest = phase == 4 and high >= breakLvl - tol and close < breakLvl and close < open
+
+longSig  = allowLong  and canTrade and trendOkLong  and longRetest
+shortSig = allowShort and canTrade and trendOkShort and shortRetest
+
+// ─────────────────────── GESTION DE POSITION ────────────────────────────────
+var float stopPrice = na
+var float tpPrice   = na
+var float riskDist  = na
+
+calcQty(slDistance) =>
+    riskMoney = strategy.equity * riskPct / 100
+    qty = riskMoney / slDistance
+    math.max(qty, 0.01)
+
+if longSig
+    stopPrice := math.min(low, breakLvl) - atrVal * slPad
+    riskDist  := close - stopPrice
+    tpPrice   := close + riskDist * rrRatio
+    q = calcQty(riskDist)
+    msgLong = '{"bot":"GOLD_OPEN_RETEST","action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp":' + str.tostring(tpPrice, format.mintick) + ',"risk_pct":' + str.tostring(riskPct) + '}'
+    strategy.entry("ACHAT", strategy.long, qty = q, alert_message = msgLong)
+    tradesToday += 1
+    phase := 0
+
+if shortSig
+    stopPrice := math.max(high, breakLvl) + atrVal * slPad
+    riskDist  := stopPrice - close
+    tpPrice   := close - riskDist * rrRatio
+    q = calcQty(riskDist)
+    msgShort = '{"bot":"GOLD_OPEN_RETEST","action":"sell","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp":' + str.tostring(tpPrice, format.mintick) + ',"risk_pct":' + str.tostring(riskPct) + '}'
+    strategy.entry("VENTE", strategy.short, qty = q, alert_message = msgShort)
+    tradesToday += 1
+    phase := 0
+
+// Break-Even + trailing stop pendant la position
+if strategy.position_size > 0
+    entryP = strategy.position_avg_price
+    if useBE and high >= entryP + riskDist
+        stopPrice := math.max(stopPrice, entryP + syminfo.mintick * 10)
+    if useTrail and high >= entryP + riskDist
+        stopPrice := math.max(stopPrice, close - atrVal * trailMult)
+
+if strategy.position_size < 0
+    entryP = strategy.position_avg_price
+    if useBE and low <= entryP - riskDist
+        stopPrice := math.min(stopPrice, entryP - syminfo.mintick * 10)
+    if useTrail and low <= entryP - riskDist
+        stopPrice := math.min(stopPrice, close + atrVal * trailMult)
+
+msgCloseLong  = '{"bot":"GOLD_OPEN_RETEST","action":"close_buy","symbol":"' + syminfo.ticker + '"}'
+msgCloseShort = '{"bot":"GOLD_OPEN_RETEST","action":"close_sell","symbol":"' + syminfo.ticker + '"}'
+
+if strategy.position_size > 0
+    strategy.exit("SORTIE-A", from_entry = "ACHAT", stop = stopPrice, limit = tpPrice, alert_message = msgCloseLong)
+if strategy.position_size < 0
+    strategy.exit("SORTIE-V", from_entry = "VENTE", stop = stopPrice, limit = tpPrice, alert_message = msgCloseShort)
+
+// ─────────────────────────── AFFICHAGE ─────────────────────────────────────
+showRange = phase >= 1
+plot(showRange ? orHigh : na, "Haut du range d'ouverture", color = color.new(color.yellow, 0),  style = plot.style_linebr, linewidth = 2)
+plot(showRange ? orLow  : na, "Bas du range d'ouverture",  color = color.new(color.yellow, 0),  style = plot.style_linebr, linewidth = 2)
+plot(phase == 3 or phase == 4 ? breakLvl : na, "Niveau cassé (attente retest)", color = color.new(color.fuchsia, 0), style = plot.style_linebr, linewidth = 2)
+plot(emaTrend, "EMA 200", color = useTrendF ? color.new(color.gray, 30) : color.new(color.gray, 85), linewidth = 1)
+
+plotshape(phase == 3 and phase[1] == 2, "Cassure HAUT",  shape.circle, location.abovebar, color.new(color.aqua, 0),   size = size.tiny, text = "CASSURE")
+plotshape(phase == 4 and phase[1] == 2, "Cassure BAS",   shape.circle, location.belowbar, color.new(color.aqua, 0),   size = size.tiny, text = "CASSURE")
+plotshape(longSig,  "ACHAT sur retest", shape.triangleup,   location.belowbar, color.new(color.green, 0), size = size.small, text = "ACHAT\nRETEST")
+plotshape(shortSig, "VENTE sur retest", shape.triangledown, location.abovebar, color.new(color.red, 0),   size = size.small, text = "VENTE\nRETEST")
+
+plot(strategy.position_size != 0 ? stopPrice : na, "Stop Loss",   color = color.new(color.red, 0),   style = plot.style_linebr)
+plot(strategy.position_size != 0 ? tpPrice   : na, "Take Profit", color = color.new(color.green, 0), style = plot.style_linebr)
+
+bgcolor(inOR ? color.new(color.yellow, 90) : na, title = "Range d'ouverture")
+bgcolor(phase == 3 ? color.new(color.green, 95) : phase == 4 ? color.new(color.red, 95) : na, title = "Attente retest")
+bgcolor(dailyLossHit ? color.new(color.red, 88) : na, title = "Coupe-circuit journalier")
+
+// ─────────────────────── TABLEAU DE BORD ───────────────────────────────────
+var table dash = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 20), border_width = 1, border_color = color.new(color.gray, 60))
+if barstate.islast
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+    etat = phase == 1 ? "RANGE EN COURS" : phase == 2 ? "ATTENTE CASSURE" : phase == 3 ? "RETEST ACHAT ?" : phase == 4 ? "RETEST VENTE ?" : "EN VEILLE"
+    table.cell(dash, 0, 0, "GOLD OPEN RETEST", text_color = color.yellow, text_size = size.small)
+    table.cell(dash, 1, 0, etat, text_color = phase == 3 ? color.green : phase == 4 ? color.red : color.white, text_size = size.small)
+    table.cell(dash, 0, 1, "Trades fermés", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 1, str.tostring(strategy.closedtrades), text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 0, 2, "Taux de réussite", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 2, str.tostring(winRate, "#.#") + " %", text_color = winRate >= 45 ? color.green : color.orange, text_size = size.tiny)
+    table.cell(dash, 0, 3, "Profit Factor", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 3, str.tostring(pf, "#.##"), text_color = pf >= 1.3 ? color.green : color.orange, text_size = size.tiny)
+    table.cell(dash, 0, 4, "P&L net", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 4, str.tostring(strategy.netprofit, "#.##") + " $", text_color = strategy.netprofit >= 0 ? color.green : color.red, text_size = size.tiny)
+    table.cell(dash, 0, 5, "Trades aujourd'hui", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 5, str.tostring(tradesToday) + " / " + str.tostring(maxPerDay), text_color = tradesToday >= maxPerDay ? color.red : color.white, text_size = size.tiny)
