@@ -1,0 +1,332 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  GOLD PRO SMT 15M — Le setup complet du pro trader — OR (XAUUSD) — 15 min
+//
+//  LA HIÉRARCHIE DU TRADE (tout doit se respecter, dans l'ordre) :
+//
+//   ① STRUCTURE (obligatoire)   : BOS/CHoCH → haussier ou baissier.
+//                                  On ne trade JAMAIS contre la structure.
+//   ② SMT DIVERGENCE            : l'or casse un creux mais l'ARGENT (XAGUSD)
+//                                  refuse de casser le sien → les institutions
+//                                  n'ont pas suivi la baisse = signal d'ACHAT.
+//                                  (miroir sur les sommets pour la VENTE)
+//   ③ PRISE DE LIQUIDITÉ        : mèche qui chasse les stops sous les creux
+//                                  (ou sur les sommets) puis referme de
+//                                  l'autre côté.
+//   ④ LA BONNE BOUGIE (obligatoire) : la bougie de confirmation qui déclenche.
+//        • ENGLOBANTE : avale entièrement la bougie précédente
+//        • PIN BAR    : grande mèche de rejet (≥ 60 % de la bougie)
+//        • IMPULSION  : gros corps ≥ 1,2 × ATR dans le sens
+//      → le bot te dit LAQUELLE a déclenché, écrit sur le graphique.
+//   ⑤ VOLUME                    : au-dessus de la moyenne.
+//
+//  ENTRÉE = Structure OK + Bonne bougie OK + au moins 2 confirmations
+//           parmi (SMT, Liquidité, Volume).
+//  SORTIE = Stop Loss derrière la bougie de confirmation,
+//           TP1 (1R, prise partielle 50 % → stop à Break-Even),
+//           TP2 (2,5R, objectif final = où le prix peut aller),
+//           trailing ATR sur le reste après TP1.
+// ═══════════════════════════════════════════════════════════════════════════
+
+strategy("GOLD PRO SMT 15M",
+     shorttitle = "GOLD-SMT",
+     overlay = true,
+     initial_capital = 10000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 0.5,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_labels_count = 500,
+     max_lines_count = 500,
+     max_bars_back = 500)
+
+// ─────────────────────────── PARAMÈTRES ────────────────────────────────────
+grpSmt    = "① SMT Divergence"
+grpStruct = "② Structure"
+grpTrig   = "③ La bonne bougie + confirmations"
+grpRisk   = "④ Gestion du risque"
+grpGuard  = "⑤ Protections"
+
+smtSym   = input.symbol("OANDA:XAGUSD", "Actif de comparaison SMT", group = grpSmt, tooltip = "ARGENT (XAGUSD) = corrélation positive avec l'or. Tu peux aussi mettre TVC:DXY et cocher « corrélation inverse ».")
+corrInv  = input.bool(false, "Corrélation inverse (ex : DXY)", group = grpSmt)
+liqLen   = input.int(20, "Fenêtre des extrêmes (liquidité + SMT)", minval = 5, maxval = 60, group = grpSmt, tooltip = "Nombre de bougies pour définir les creux/sommets de référence.")
+
+pivLen    = input.int(5, "Sensibilité des swings", minval = 2, maxval = 15, group = grpStruct)
+maxKeep   = input.int(2, "Nb de BOS/CHoCH affichés", minval = 1, maxval = 6, group = grpStruct)
+showSwing = input.bool(true, "Afficher les étiquettes HH/HL/LH/LL", group = grpStruct)
+
+dispMult   = input.float(1.2, "Taille de la bougie IMPULSION (× ATR)", minval = 0.5, step = 0.1, group = grpTrig)
+volMult    = input.float(1.3, "Volume mini (× moyenne)", minval = 1.0, step = 0.1, group = grpTrig)
+confWindow = input.int(5, "Fenêtre de confluence (bougies)", minval = 1, maxval = 12, group = grpTrig, tooltip = "Un SMT ou une prise de liquidité reste valable X bougies pour se combiner avec la bonne bougie.")
+minExtra   = input.int(2, "Confirmations mini parmi SMT / Liquidité / Volume", minval = 1, maxval = 3, group = grpTrig)
+
+riskPct   = input.float(1.0, "Risque par trade (% du capital)", minval = 0.1, maxval = 3, step = 0.1, group = grpRisk)
+slPad     = input.float(0.3, "Marge du SL derrière la bougie (× ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+tp1RR     = input.float(1.0, "TP1 = × le risque (prise partielle)", minval = 0.5, step = 0.25, group = grpRisk, tooltip = "À TP1 le bot ferme une partie de la position et met le stop à Break-Even : le trade ne peut plus perdre.")
+tp1Pct    = input.float(50,  "% de la position fermée au TP1", minval = 10, maxval = 90, step = 5, group = grpRisk)
+tp2RR     = input.float(2.5, "TP2 = × le risque (objectif final)", minval = 1.0, step = 0.25, group = grpRisk, tooltip = "Là où le prix pourrait aller si le mouvement se déroule. Le reste de la position vise cet objectif.")
+trailMult = input.float(2.0, "Trailing stop (× ATR) après TP1", minval = 0.5, step = 0.1, group = grpRisk)
+
+maxPerDay  = input.int(2,     "Max trades par jour", minval = 1, maxval = 6, group = grpGuard)
+maxDayLoss = input.float(3.0, "Perte journalière max (%)", minval = 0.5, step = 0.5, group = grpGuard)
+useSess    = input.bool(true, "Trader uniquement Londres + New York", group = grpGuard)
+sessStr    = input.session("0700-2030", "Plage horaire (UTC)", group = grpGuard)
+allowLong  = input.bool(true, "Autoriser les ACHATS", group = grpGuard)
+allowShort = input.bool(true, "Autoriser les VENTES", group = grpGuard)
+
+// ─────────────────────────── OUTILS ────────────────────────────────────────
+atrVal = ta.atr(14)
+volAvg = ta.sma(volume, 20)
+inSession = not useSess or not na(time(timeframe.period, sessStr, "UTC"))
+
+newDay = ta.change(time("D")) != 0
+var int   tradesToday    = 0
+var float dayStartEquity = strategy.equity
+if newDay
+    tradesToday    := 0
+    dayStartEquity := strategy.equity
+
+dailyLossHit = strategy.equity <= dayStartEquity * (1 - maxDayLoss / 100)
+canTrade     = tradesToday < maxPerDay and not dailyLossHit and strategy.position_size == 0
+
+// ═══════════════ ① STRUCTURE : trend via BOS / CHoCH ════════════════════════
+ph  = ta.pivothigh(high, pivLen, pivLen)
+plv = ta.pivotlow(low, pivLen, pivLen)
+
+var float prevPH = na
+var float prevPL = na
+var float lastSH = na
+var int   lastSHbar = na
+var float lastSL = na
+var int   lastSLbar = na
+var int   trend  = 0
+var string lastEventTxt = "—"
+
+var array<label> swingLabs   = array.new<label>()
+var array<line>  structLines = array.new<line>()
+var array<label> structLabs  = array.new<label>()
+
+if not na(ph)
+    if showSwing
+        txtH = na(prevPH) ? "H" : ph > prevPH ? "HH" : "LH"
+        lb = label.new(bar_index - pivLen, ph, txtH, style = label.style_label_down, color = color.new(color.black, 100), textcolor = txtH == "HH" ? color.green : txtH == "LH" ? color.red : color.gray, size = size.small)
+        array.push(swingLabs, lb)
+        if array.size(swingLabs) > 12
+            label.delete(array.shift(swingLabs))
+    prevPH := ph
+    lastSH := ph
+    lastSHbar := bar_index - pivLen
+
+if not na(plv)
+    if showSwing
+        txtL = na(prevPL) ? "L" : plv > prevPL ? "HL" : "LL"
+        lb = label.new(bar_index - pivLen, plv, txtL, style = label.style_label_up, color = color.new(color.black, 100), textcolor = txtL == "HL" ? color.green : txtL == "LL" ? color.red : color.gray, size = size.small)
+        array.push(swingLabs, lb)
+        if array.size(swingLabs) > 12
+            label.delete(array.shift(swingLabs))
+    prevPL := plv
+    lastSL := plv
+    lastSLbar := bar_index - pivLen
+
+addStructMark(int x1, float y, string evt, bool up) =>
+    col = up ? color.new(color.green, 0) : color.new(color.red, 0)
+    ln = line.new(x1, y, bar_index, y, color = col, width = 2, style = evt == "BOS" ? line.style_solid : line.style_dashed)
+    lb = label.new(bar_index, y, evt + (up ? " ↑" : " ↓"), style = up ? label.style_label_down : label.style_label_up, color = color.new(up ? color.green : color.red, evt == "BOS" ? 60 : 20), textcolor = color.white, size = size.small)
+    array.push(structLines, ln)
+    array.push(structLabs, lb)
+    if array.size(structLines) > maxKeep
+        line.delete(array.shift(structLines))
+        label.delete(array.shift(structLabs))
+
+if not na(lastSH) and close > lastSH
+    evt = trend == 1 ? "BOS" : "CHoCH"
+    addStructMark(lastSHbar, lastSH, evt, true)
+    trend := 1
+    lastEventTxt := evt + " ↑"
+    lastSH := na
+
+if not na(lastSL) and close < lastSL
+    evt = trend == -1 ? "BOS" : "CHoCH"
+    addStructMark(lastSLbar, lastSL, evt, false)
+    trend := -1
+    lastEventTxt := evt + " ↓"
+    lastSL := na
+
+// ═══════════════ ② SMT DIVERGENCE (or vs argent/DXY) ════════════════════════
+[cHigh, cLow] = request.security(smtSym, timeframe.period, [high, low], lookahead = barmerge.lookahead_off)
+
+prevLowN   = ta.lowest(low, liqLen)[1]
+prevHighN  = ta.highest(high, liqLen)[1]
+cPrevLowN  = ta.lowest(cLow, liqLen)[1]
+cPrevHighN = ta.highest(cHigh, liqLen)[1]
+
+goldTookLows  = low < prevLowN
+goldTookHighs = high > prevHighN
+compTookLows  = cLow < cPrevLowN
+compTookHighs = cHigh > cPrevHighN
+
+// Corrélation positive (argent) : l'or casse, l'argent refuse → divergence
+// Corrélation inverse (DXY)    : l'or casse ses creux, le DXY refuse de
+//                                casser ses sommets → divergence
+smtBullNow = corrInv ? (goldTookLows and not compTookHighs) : (goldTookLows and not compTookLows)
+smtBearNow = corrInv ? (goldTookHighs and not compTookLows) : (goldTookHighs and not compTookHighs)
+
+// ═══════════════ ③ PRISE DE LIQUIDITÉ ═══════════════════════════════════════
+sweepBullNow = goldTookLows and close > prevLowN     // mèche sous les creux + rejet
+sweepBearNow = goldTookHighs and close < prevHighN   // mèche sur les sommets + rejet
+
+// Mémoire des événements (valables confWindow bougies)
+var int smtBullBar = na
+var int smtBearBar = na
+var int sweepBullBar = na
+var int sweepBearBar = na
+if smtBullNow
+    smtBullBar := bar_index
+if smtBearNow
+    smtBearBar := bar_index
+if sweepBullNow
+    sweepBullBar := bar_index
+if sweepBearNow
+    sweepBearBar := bar_index
+
+recent(int b) =>
+    not na(b) and bar_index - b <= confWindow
+
+confSmtL   = recent(smtBullBar)
+confSmtS   = recent(smtBearBar)
+confSweepL = recent(sweepBullBar)
+confSweepS = recent(sweepBearBar)
+
+// ═══════════════ ④ LA BONNE BOUGIE (le déclencheur) ═════════════════════════
+rng     = math.max(high - low, syminfo.mintick)
+lowWick = math.min(open, close) - low
+upWick  = high - math.max(open, close)
+
+bullEngulf = close > open and close[1] < open[1] and close >= high[1] and open <= close[1]
+bearEngulf = close < open and close[1] > open[1] and close <= low[1] and open >= close[1]
+bullPin    = lowWick >= 0.6 * rng and close >= high - 0.4 * rng
+bearPin    = upWick >= 0.6 * rng and close <= low + 0.4 * rng
+bullDisp   = close > open and (close - open) >= dispMult * atrVal
+bearDisp   = close < open and (open - close) >= dispMult * atrVal
+
+triggerBullTxt = bullEngulf ? "ENGLOBANTE" : bullPin ? "PIN BAR" : bullDisp ? "IMPULSION" : ""
+triggerBearTxt = bearEngulf ? "ENGLOBANTE" : bearPin ? "PIN BAR" : bearDisp ? "IMPULSION" : ""
+triggerBull = triggerBullTxt != ""
+triggerBear = triggerBearTxt != ""
+
+// ═══════════════ ⑤ VOLUME ═══════════════════════════════════════════════════
+volOK = volume >= volAvg * volMult
+
+// ═══════════════ LE VERDICT : tout doit se respecter ════════════════════════
+extraL = (confSmtL ? 1 : 0) + (confSweepL ? 1 : 0) + (volOK ? 1 : 0)
+extraS = (confSmtS ? 1 : 0) + (confSweepS ? 1 : 0) + (volOK ? 1 : 0)
+
+longSig  = allowLong  and canTrade and inSession and trend == 1  and triggerBull and extraL >= minExtra
+shortSig = allowShort and canTrade and inSession and trend == -1 and triggerBear and extraS >= minExtra
+
+// ─────────────────────── GESTION DE POSITION ────────────────────────────────
+var float stopPrice = na
+var float tp1Price  = na
+var float tp2Price  = na
+var float riskDist  = na
+
+calcQty(slDistance) =>
+    math.max((strategy.equity * riskPct / 100) / slDistance, 0.01)
+
+if longSig
+    stopPrice := low - atrVal * slPad
+    riskDist  := math.max(close - stopPrice, 0.5 * atrVal)
+    tp1Price  := close + riskDist * tp1RR
+    tp2Price  := close + riskDist * tp2RR
+    q = calcQty(riskDist)
+    strategy.entry("ACHAT", strategy.long, qty = q, alert_message = '{"bot":"GOLD_SMT","action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp1":' + str.tostring(tp1Price, format.mintick) + ',"tp2":' + str.tostring(tp2Price, format.mintick) + ',"bougie":"' + triggerBullTxt + '"}')
+    label.new(bar_index, low - atrVal, "ACHAT ▲ " + triggerBullTxt + (confSmtL ? " + SMT" : "") + (confSweepL ? " + LIQ" : "") + (volOK ? " + VOL" : "") + "\nSL  " + str.tostring(stopPrice, format.mintick) + "\nTP1 " + str.tostring(tp1Price, format.mintick) + "\nTP2 " + str.tostring(tp2Price, format.mintick), style = label.style_label_up, color = color.new(color.green, 10), textcolor = color.white, size = size.small)
+    tradesToday += 1
+    smtBullBar := na
+    sweepBullBar := na
+
+if shortSig
+    stopPrice := high + atrVal * slPad
+    riskDist  := math.max(stopPrice - close, 0.5 * atrVal)
+    tp1Price  := close - riskDist * tp1RR
+    tp2Price  := close - riskDist * tp2RR
+    q = calcQty(riskDist)
+    strategy.entry("VENTE", strategy.short, qty = q, alert_message = '{"bot":"GOLD_SMT","action":"sell","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp1":' + str.tostring(tp1Price, format.mintick) + ',"tp2":' + str.tostring(tp2Price, format.mintick) + ',"bougie":"' + triggerBearTxt + '"}')
+    label.new(bar_index, high + atrVal, "VENTE ▼ " + triggerBearTxt + (confSmtS ? " + SMT" : "") + (confSweepS ? " + LIQ" : "") + (volOK ? " + VOL" : "") + "\nSL  " + str.tostring(stopPrice, format.mintick) + "\nTP1 " + str.tostring(tp1Price, format.mintick) + "\nTP2 " + str.tostring(tp2Price, format.mintick), style = label.style_label_down, color = color.new(color.red, 10), textcolor = color.white, size = size.small)
+    tradesToday += 1
+    smtBearBar := na
+    sweepBearBar := na
+
+// Après TP1 : stop à Break-Even puis trailing ATR sur le reste
+if strategy.position_size > 0
+    entryP = strategy.position_avg_price
+    if high >= entryP + riskDist * tp1RR
+        stopPrice := math.max(stopPrice, entryP + syminfo.mintick * 10)
+        stopPrice := math.max(stopPrice, close - atrVal * trailMult)
+
+if strategy.position_size < 0
+    entryP = strategy.position_avg_price
+    if low <= entryP - riskDist * tp1RR
+        stopPrice := math.min(stopPrice, entryP - syminfo.mintick * 10)
+        stopPrice := math.min(stopPrice, close + atrVal * trailMult)
+
+// TP1 = prise partielle | TP2 = objectif final (le reste de la position)
+if strategy.position_size > 0
+    strategy.exit("TP1-A", from_entry = "ACHAT", qty_percent = tp1Pct, stop = stopPrice, limit = tp1Price, alert_message = '{"bot":"GOLD_SMT","action":"tp1_buy","symbol":"' + syminfo.ticker + '"}')
+    strategy.exit("TP2-A", from_entry = "ACHAT", qty_percent = 100, stop = stopPrice, limit = tp2Price, alert_message = '{"bot":"GOLD_SMT","action":"close_buy","symbol":"' + syminfo.ticker + '"}')
+if strategy.position_size < 0
+    strategy.exit("TP1-V", from_entry = "VENTE", qty_percent = tp1Pct, stop = stopPrice, limit = tp1Price, alert_message = '{"bot":"GOLD_SMT","action":"tp1_sell","symbol":"' + syminfo.ticker + '"}')
+    strategy.exit("TP2-V", from_entry = "VENTE", qty_percent = 100, stop = stopPrice, limit = tp2Price, alert_message = '{"bot":"GOLD_SMT","action":"close_sell","symbol":"' + syminfo.ticker + '"}')
+
+// ─────────────────────────── VISUELS ────────────────────────────────────────
+plotshape(smtBullNow, "SMT haussier", shape.diamond, location.belowbar, color.new(color.aqua, 0), size = size.tiny, text = "SMT")
+plotshape(smtBearNow, "SMT baissier", shape.diamond, location.abovebar, color.new(color.aqua, 0), size = size.tiny, text = "SMT")
+plotshape(sweepBullNow, "Liquidité prise (bas)",  shape.circle, location.belowbar, color.new(color.fuchsia, 0), size = size.tiny, text = "LIQ")
+plotshape(sweepBearNow, "Liquidité prise (haut)", shape.circle, location.abovebar, color.new(color.fuchsia, 0), size = size.tiny, text = "LIQ")
+
+plot(strategy.position_size != 0 ? stopPrice : na, "Stop Loss", color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size != 0 ? tp1Price  : na, "TP1",       color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size != 0 ? tp2Price  : na, "TP2",       color = color.new(color.teal, 0),  style = plot.style_linebr, linewidth = 2)
+
+bgcolor(dailyLossHit ? color.new(color.red, 88) : na, title = "Coupe-circuit journalier")
+
+// ═══════════════ LE PANNEAU DU PRO (coin haut droit) ════════════════════════
+var table dash = table.new(position.top_right, 2, 10, bgcolor = color.new(color.black, 10), border_width = 1, border_color = color.new(color.gray, 55))
+ck(bool v) => v ? "✔" : "✘"
+ckCol(bool v) => v ? color.green : color.new(color.gray, 45)
+if barstate.islast
+    structTxt = trend == 1 ? "HAUSSIER ↑" : trend == -1 ? "BAISSIER ↓" : "EN ATTENTE"
+    structCol = trend == 1 ? color.green : trend == -1 ? color.red : color.gray
+    smtOk   = trend == 1 ? confSmtL : trend == -1 ? confSmtS : false
+    liqOk   = trend == 1 ? confSweepL : trend == -1 ? confSweepS : false
+    trigTxt = trend == 1 ? (triggerBull ? triggerBullTxt : "✘ pas encore") : trend == -1 ? (triggerBear ? triggerBearTxt : "✘ pas encore") : "—"
+    trigOk  = trend == 1 ? triggerBull : trend == -1 ? triggerBear : false
+    nExtra  = trend == 1 ? extraL : trend == -1 ? extraS : 0
+    ready   = trend != 0 and trigOk and nExtra >= minExtra
+    table.cell(dash, 0, 0, "GOLD PRO SMT", text_color = color.yellow, text_size = size.small)
+    table.cell(dash, 1, 0, structTxt + "  (" + lastEventTxt + ")", text_color = structCol, text_size = size.small)
+    table.cell(dash, 0, 1, "① Structure", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 1, ck(trend != 0), text_color = ckCol(trend != 0), text_size = size.small)
+    table.cell(dash, 0, 2, "② SMT divergence", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 2, ck(smtOk), text_color = ckCol(smtOk), text_size = size.small)
+    table.cell(dash, 0, 3, "③ Prise de liquidité", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 3, ck(liqOk), text_color = ckCol(liqOk), text_size = size.small)
+    table.cell(dash, 0, 4, "④ La bonne bougie", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 4, trigTxt, text_color = ckCol(trigOk), text_size = size.tiny)
+    table.cell(dash, 0, 5, "⑤ Volume fort", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 5, ck(volOK), text_color = ckCol(volOK), text_size = size.small)
+    table.cell(dash, 0, 6, "VERDICT", text_color = color.yellow, text_size = size.tiny)
+    table.cell(dash, 1, 6, ready ? (trend == 1 ? "TOUT SE RESPECTE → ACHAT" : "TOUT SE RESPECTE → VENTE") : "ON ATTEND", text_color = ready ? (trend == 1 ? color.green : color.red) : color.gray, text_size = size.small)
+    tgtTxt = strategy.position_size != 0 ? "TP1 " + str.tostring(tp1Price, format.mintick) + "  →  TP2 " + str.tostring(tp2Price, format.mintick) : "affichés dès l'entrée"
+    table.cell(dash, 0, 7, "Objectifs (où le prix peut aller)", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 7, tgtTxt, text_color = strategy.position_size != 0 ? color.teal : color.gray, text_size = size.tiny)
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+    table.cell(dash, 0, 8, "Réussite / PF", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 8, str.tostring(winRate, "#.#") + " % / " + str.tostring(pf, "#.##"), text_color = pf >= 1.3 ? color.green : color.orange, text_size = size.tiny)
+    table.cell(dash, 0, 9, "Trades aujourd'hui", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 9, str.tostring(tradesToday) + " / " + str.tostring(maxPerDay), text_color = tradesToday >= maxPerDay ? color.red : color.white, text_size = size.tiny)
