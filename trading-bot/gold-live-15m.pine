@@ -71,6 +71,13 @@ sessStr    = input.session("0700-2030", "Plage horaire (UTC)", group = grpGuard)
 allowLong  = input.bool(true, "Autoriser les ACHATS", group = grpGuard)
 allowShort = input.bool(true, "Autoriser les VENTES", group = grpGuard)
 
+grpSR = "⑤ Supports / Résistances + Asie"
+showSR   = input.bool(true, "Afficher les supports / résistances", group = grpSR)
+pivSR    = input.int(10, "Sensibilité des S/R (pivots)", minval = 3, maxval = 30, group = grpSR)
+maxSR    = input.int(4, "Nombre de niveaux S/R par côté", minval = 2, maxval = 8, group = grpSR)
+showAsia = input.bool(true, "Afficher le High/Low de l'Asie", group = grpSR)
+asiaSess = input.session("0000-0700", "Session Asie (UTC)", group = grpSR)
+
 // ─────────────────────────── OUTILS ────────────────────────────────────────
 atrVal = ta.atr(14)
 volAvg = ta.sma(volume, 20)
@@ -334,11 +341,122 @@ if strategy.position_size < 0
     strategy.exit("TP1-V", from_entry = "VENTE", qty_percent = tp1Pct, stop = stopPrice, limit = tp1Price, alert_message = '{"bot":"GOLD_LIVE","action":"tp1_sell","symbol":"' + syminfo.ticker + '"}')
     strategy.exit("TP2-V", from_entry = "VENTE", qty_percent = 100, stop = stopPrice, limit = tp2Price, alert_message = '{"bot":"GOLD_LIVE","action":"close_sell","symbol":"' + syminfo.ticker + '"}')
 
+// ═══════════════ SUPPORTS / RÉSISTANCES (annoncés en direct) ════════════════
+var array<line>  resLines = array.new<line>()
+var array<float> resLvls  = array.new<float>()
+var array<line>  supLines = array.new<line>()
+var array<float> supLvls  = array.new<float>()
+
+phSR  = ta.pivothigh(high, pivSR, pivSR)
+plSR  = ta.pivotlow(low, pivSR, pivSR)
+
+if showSR and not na(phSR)
+    l = line.new(bar_index - pivSR, phSR, bar_index, phSR, extend = extend.right, color = color.new(color.red, 25), width = 2)
+    array.push(resLines, l)
+    array.push(resLvls, phSR)
+    if array.size(resLines) > maxSR
+        line.delete(array.shift(resLines))
+        array.shift(resLvls)
+
+if showSR and not na(plSR)
+    l = line.new(bar_index - pivSR, plSR, bar_index, plSR, extend = extend.right, color = color.new(color.green, 25), width = 2)
+    array.push(supLines, l)
+    array.push(supLvls, plSR)
+    if array.size(supLines) > maxSR
+        line.delete(array.shift(supLines))
+        array.shift(supLvls)
+
+if array.size(resLvls) > 0
+    for i = array.size(resLvls) - 1 to 0
+        lvl = array.get(resLvls, i)
+        ln  = array.get(resLines, i)
+        if close > lvl
+            line.set_extend(ln, extend.none)
+            line.set_x2(ln, bar_index)
+            line.set_color(ln, color.new(color.gray, 75))
+            line.set_style(ln, line.style_dashed)
+            array.remove(resLines, i)
+            array.remove(resLvls, i)
+            lastEvt := "Résistance cassée"
+            lastEvtBar := bar_index
+            sayEvent("🔓 RÉSISTANCE CASSÉE à " + str.tostring(lvl, format.mintick))
+        else if high >= lvl and low <= lvl and not (high[1] >= lvl and low[1] <= lvl)
+            sayEvent("🔴 Le prix touche la RÉSISTANCE " + str.tostring(lvl, format.mintick))
+
+if array.size(supLvls) > 0
+    for i = array.size(supLvls) - 1 to 0
+        lvl = array.get(supLvls, i)
+        ln  = array.get(supLines, i)
+        if close < lvl
+            line.set_extend(ln, extend.none)
+            line.set_x2(ln, bar_index)
+            line.set_color(ln, color.new(color.gray, 75))
+            line.set_style(ln, line.style_dashed)
+            array.remove(supLines, i)
+            array.remove(supLvls, i)
+            lastEvt := "Support cassé"
+            lastEvtBar := bar_index
+            sayEvent("🔓 SUPPORT CASSÉ à " + str.tostring(lvl, format.mintick))
+        else if high >= lvl and low <= lvl and not (high[1] >= lvl and low[1] <= lvl)
+            sayEvent("🟢 Le prix touche le SUPPORT " + str.tostring(lvl, format.mintick))
+
+// ═══════════════ ASIA HIGH / ASIA LOW ═══════════════════════════════════════
+inAsia    = showAsia and not na(time(timeframe.period, asiaSess, "UTC"))
+asiaStart = inAsia and not inAsia[1]
+
+var float aHigh = na
+var float aLow  = na
+var line  aHiLn = na
+var line  aLoLn = na
+var label aHiLb = na
+var label aLoLb = na
+
+if asiaStart
+    line.delete(aHiLn)
+    line.delete(aLoLn)
+    label.delete(aHiLb)
+    label.delete(aLoLb)
+    aHigh := high
+    aLow  := low
+    aHiLn := line.new(bar_index, high, bar_index, high, color = color.new(color.yellow, 0), width = 2)
+    aLoLn := line.new(bar_index, low,  bar_index, low,  color = color.new(color.yellow, 0), width = 2)
+    aHiLb := label.new(bar_index, high, "ASIA HIGH", style = label.style_label_left, color = color.new(color.yellow, 20), textcolor = color.black, size = size.small)
+    aLoLb := label.new(bar_index, low,  "ASIA LOW",  style = label.style_label_left, color = color.new(color.yellow, 20), textcolor = color.black, size = size.small)
+
+if inAsia and not na(aHiLn)
+    aHigh := math.max(aHigh, high)
+    aLow  := math.min(aLow, low)
+    line.set_y1(aHiLn, aHigh)
+    line.set_y2(aHiLn, aHigh)
+    line.set_y1(aLoLn, aLow)
+    line.set_y2(aLoLn, aLow)
+    label.set_y(aHiLb, aHigh)
+    label.set_y(aLoLb, aLow)
+
+if not na(aHiLn)
+    line.set_x2(aHiLn, bar_index)
+    line.set_x2(aLoLn, bar_index)
+    label.set_x(aHiLb, bar_index)
+    label.set_x(aLoLb, bar_index)
+    label.set_text(aHiLb, "ASIA HIGH " + str.tostring(aHigh, format.mintick))
+    label.set_text(aLoLb, "ASIA LOW " + str.tostring(aLow, format.mintick))
+
+if not inAsia and not na(aHigh)
+    if high >= aHigh and high[1] < aHigh
+        lastEvt := "Le prix chasse le ASIA HIGH"
+        lastEvtBar := bar_index
+        sayEvent("⭐ Le prix vient CHERCHER le ASIA HIGH " + str.tostring(aHigh, format.mintick) + " (liquidité)")
+    if low <= aLow and low[1] > aLow
+        lastEvt := "Le prix chasse le ASIA LOW"
+        lastEvtBar := bar_index
+        sayEvent("⭐ Le prix vient CHERCHER le ASIA LOW " + str.tostring(aLow, format.mintick) + " (liquidité)")
+
 // ─────────────────────────── LIGNES DE POSITION ─────────────────────────────
 plot(strategy.position_size != 0 ? stopPrice : na, "Stop Loss", color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2)
 plot(strategy.position_size != 0 ? tp1Price  : na, "TP1",       color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
 plot(strategy.position_size != 0 ? tp2Price  : na, "TP2",       color = color.new(color.teal, 0),  style = plot.style_linebr, linewidth = 2)
 
+bgcolor(inAsia ? color.new(color.yellow, 94) : na, title = "Session Asie")
 bgcolor(dailyLossHit ? color.new(color.red, 88) : na, title = "Coupe-circuit journalier")
 
 // ═══════════════ LE PANNEAU TEMPS RÉEL (coin haut droit) ════════════════════
