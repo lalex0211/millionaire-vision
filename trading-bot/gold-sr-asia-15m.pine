@@ -1,0 +1,188 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  S/R + ASIA HIGH-LOW — Graphique épuré — OR (XAUUSD) — 15 minutes
+//
+//  Affiche UNIQUEMENT :
+//   • SUPPORTS (lignes vertes)      = creux validés, sous le prix
+//   • RÉSISTANCES (lignes rouges)   = sommets validés, au-dessus du prix
+//     → une ligne cassée en clôture disparaît (grisée)
+//   • ASIA HIGH / ASIA LOW (jaune)  = le plus haut et le plus bas de la
+//     session asiatique. C'est LA liquidité que Londres et New York
+//     viennent chercher à l'ouverture.
+//
+//  ALERTES (optionnelles) : le script peut te prévenir quand le prix
+//  touche ou casse un niveau. Crée UNE alerte avec la condition
+//  « Toute fonction alert() » pour les recevoir.
+// ═══════════════════════════════════════════════════════════════════════════
+
+indicator("S/R + ASIA HIGH-LOW — Gold 15m",
+     shorttitle = "SR-ASIA",
+     overlay = true,
+     max_lines_count = 500,
+     max_labels_count = 500)
+
+// ─────────────────────────── PARAMÈTRES ────────────────────────────────────
+grpSR   = "① Supports / Résistances"
+grpAsia = "② Session Asie"
+grpAl   = "③ Alertes"
+
+pivLen  = input.int(10, "Sensibilité des S/R (pivots)", minval = 3, maxval = 30, group = grpSR, tooltip = "Nombre de bougies de chaque côté pour valider un niveau. Plus grand = niveaux plus importants, moins nombreux.")
+maxSR   = input.int(5, "Nombre de niveaux gardés par côté", minval = 2, maxval = 10, group = grpSR)
+showBrk = input.bool(true, "Garder les niveaux cassés en gris", group = grpSR)
+
+asiaSess = input.session("0000-0700", "Session Asie (UTC)", group = grpAsia, tooltip = "Par défaut 00h00 → 07h00 UTC (Tokyo + Sydney). Ajuste si ton courtier décale.")
+keepPrev = input.bool(false, "Garder l'Asie des jours précédents", group = grpAsia)
+shadeAsia = input.bool(true, "Colorer le fond pendant la session Asie", group = grpAsia)
+
+alertOn = input.bool(true, "Alertes touche / cassure des niveaux", group = grpAl)
+
+// ─────────────────────── SUPPORTS / RÉSISTANCES ─────────────────────────────
+var array<line>  resLines = array.new<line>()
+var array<float> resLvls  = array.new<float>()
+var array<line>  supLines = array.new<line>()
+var array<float> supLvls  = array.new<float>()
+
+ph  = ta.pivothigh(high, pivLen, pivLen)
+plv = ta.pivotlow(low, pivLen, pivLen)
+
+if not na(ph)
+    l = line.new(bar_index - pivLen, ph, bar_index, ph, extend = extend.right, color = color.new(color.red, 20), width = 2)
+    array.push(resLines, l)
+    array.push(resLvls, ph)
+    if array.size(resLines) > maxSR
+        line.delete(array.shift(resLines))
+        array.shift(resLvls)
+
+if not na(plv)
+    l = line.new(bar_index - pivLen, plv, bar_index, plv, extend = extend.right, color = color.new(color.green, 20), width = 2)
+    array.push(supLines, l)
+    array.push(supLvls, plv)
+    if array.size(supLines) > maxSR
+        line.delete(array.shift(supLines))
+        array.shift(supLvls)
+
+// Touches et cassures
+sayIt(string txt) =>
+    if alertOn
+        alert(txt + " | " + syminfo.ticker + " | prix " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+if array.size(resLvls) > 0
+    for i = array.size(resLvls) - 1 to 0
+        lvl = array.get(resLvls, i)
+        ln  = array.get(resLines, i)
+        touchedNow  = high >= lvl and low <= lvl
+        touchedPrev = high[1] >= lvl and low[1] <= lvl
+        if close > lvl
+            // Résistance CASSÉE en clôture
+            line.set_extend(ln, extend.none)
+            line.set_x2(ln, bar_index)
+            if showBrk
+                line.set_color(ln, color.new(color.gray, 70))
+                line.set_style(ln, line.style_dashed)
+            else
+                line.delete(ln)
+            array.remove(resLines, i)
+            array.remove(resLvls, i)
+            sayIt("🔓 RÉSISTANCE CASSÉE à " + str.tostring(lvl, format.mintick))
+        else if touchedNow and not touchedPrev
+            sayIt("🔴 Le prix touche la RÉSISTANCE " + str.tostring(lvl, format.mintick))
+
+if array.size(supLvls) > 0
+    for i = array.size(supLvls) - 1 to 0
+        lvl = array.get(supLvls, i)
+        ln  = array.get(supLines, i)
+        touchedNow  = high >= lvl and low <= lvl
+        touchedPrev = high[1] >= lvl and low[1] <= lvl
+        if close < lvl
+            line.set_extend(ln, extend.none)
+            line.set_x2(ln, bar_index)
+            if showBrk
+                line.set_color(ln, color.new(color.gray, 70))
+                line.set_style(ln, line.style_dashed)
+            else
+                line.delete(ln)
+            array.remove(supLines, i)
+            array.remove(supLvls, i)
+            sayIt("🔓 SUPPORT CASSÉ à " + str.tostring(lvl, format.mintick))
+        else if touchedNow and not touchedPrev
+            sayIt("🟢 Le prix touche le SUPPORT " + str.tostring(lvl, format.mintick))
+
+// ─────────────────────── ASIA HIGH / ASIA LOW ───────────────────────────────
+inAsia    = not na(time(timeframe.period, asiaSess, "UTC"))
+asiaStart = inAsia and not inAsia[1]
+
+var float aHigh = na
+var float aLow  = na
+var line  aHiLn = na
+var line  aLoLn = na
+var label aHiLb = na
+var label aLoLb = na
+
+if asiaStart
+    // Nouveau jour : on fige ou on efface l'Asie précédente
+    if not keepPrev
+        line.delete(aHiLn)
+        line.delete(aLoLn)
+        label.delete(aHiLb)
+        label.delete(aLoLb)
+    aHigh := high
+    aLow  := low
+    aHiLn := line.new(bar_index, high, bar_index, high, color = color.new(color.yellow, 0), width = 2)
+    aLoLn := line.new(bar_index, low,  bar_index, low,  color = color.new(color.yellow, 0), width = 2)
+    aHiLb := label.new(bar_index, high, "ASIA HIGH", style = label.style_label_left, color = color.new(color.yellow, 20), textcolor = color.black, size = size.small)
+    aLoLb := label.new(bar_index, low,  "ASIA LOW",  style = label.style_label_left, color = color.new(color.yellow, 20), textcolor = color.black, size = size.small)
+
+if inAsia and not na(aHiLn)
+    aHigh := math.max(aHigh, high)
+    aLow  := math.min(aLow, low)
+    line.set_y1(aHiLn, aHigh)
+    line.set_y2(aHiLn, aHigh)
+    line.set_y1(aLoLn, aLow)
+    line.set_y2(aLoLn, aLow)
+    label.set_y(aHiLb, aHigh)
+    label.set_y(aLoLb, aLow)
+
+// Les lignes s'étendent jusqu'à la prochaine session Asie
+if not na(aHiLn)
+    line.set_x2(aHiLn, bar_index)
+    line.set_x2(aLoLn, bar_index)
+    label.set_x(aHiLb, bar_index)
+    label.set_x(aLoLb, bar_index)
+    label.set_text(aHiLb, "ASIA HIGH " + str.tostring(aHigh, format.mintick))
+    label.set_text(aLoLb, "ASIA LOW " + str.tostring(aLow, format.mintick))
+
+// Alertes sur le High/Low Asie (après la session seulement)
+if not inAsia and not na(aHigh)
+    if high >= aHigh and high[1] < aHigh
+        sayIt("⭐ Le prix vient CHERCHER le ASIA HIGH " + str.tostring(aHigh, format.mintick) + " (liquidité)")
+    if low <= aLow and low[1] > aLow
+        sayIt("⭐ Le prix vient CHERCHER le ASIA LOW " + str.tostring(aLow, format.mintick) + " (liquidité)")
+
+bgcolor(shadeAsia and inAsia ? color.new(color.yellow, 94) : na, title = "Session Asie")
+
+// ─────────────────────── MINI PANNEAU ───────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 5, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 60))
+if barstate.islast
+    // Résistance la plus proche au-dessus / support le plus proche en dessous
+    nearRes = float(na)
+    if array.size(resLvls) > 0
+        for i = 0 to array.size(resLvls) - 1
+            v = array.get(resLvls, i)
+            if v > close and (na(nearRes) or v < nearRes)
+                nearRes := v
+    nearSup = float(na)
+    if array.size(supLvls) > 0
+        for i = 0 to array.size(supLvls) - 1
+            v = array.get(supLvls, i)
+            if v < close and (na(nearSup) or v > nearSup)
+                nearSup := v
+    table.cell(dash, 0, 0, "S/R + ASIA", text_color = color.yellow, text_size = size.small)
+    table.cell(dash, 1, 0, inAsia ? "SESSION ASIE EN COURS" : "Londres / New York", text_color = inAsia ? color.yellow : color.white, text_size = size.tiny)
+    table.cell(dash, 0, 1, "Résistance au-dessus", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 1, na(nearRes) ? "—" : str.tostring(nearRes, format.mintick), text_color = color.red, text_size = size.tiny)
+    table.cell(dash, 0, 2, "Support en dessous", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 2, na(nearSup) ? "—" : str.tostring(nearSup, format.mintick), text_color = color.green, text_size = size.tiny)
+    table.cell(dash, 0, 3, "Asia High", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 3, na(aHigh) ? "—" : str.tostring(aHigh, format.mintick), text_color = color.yellow, text_size = size.tiny)
+    table.cell(dash, 0, 4, "Asia Low", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 4, na(aLow) ? "—" : str.tostring(aLow, format.mintick), text_color = color.yellow, text_size = size.tiny)
