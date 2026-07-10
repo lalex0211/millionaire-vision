@@ -1,0 +1,105 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  NIVEAUX — Résistances / Supports + ASIA HIGH-LOW — OR (XAUUSD) — 15 min
+//
+//  Version ULTRA ÉPURÉE. Sur le graphique, il n'y a QUE :
+//   • RÉSISTANCES : lignes rouges au-dessus du prix
+//   • SUPPORTS    : lignes vertes en dessous (désactivables)
+//   • ASIA HIGH / ASIA LOW : lignes jaunes = le haut et le bas de la nuit
+//  Un niveau cassé en clôture disparaît tout seul. C'est tout.
+// ═══════════════════════════════════════════════════════════════════════════
+
+indicator("NIVEAUX — Résistances + Asia High/Low",
+     shorttitle = "NIVEAUX",
+     overlay = true,
+     max_lines_count = 500,
+     max_labels_count = 100)
+
+// ─────────────────────────── PARAMÈTRES ────────────────────────────────────
+pivLen   = input.int(10, "Sensibilité des niveaux", minval = 3, maxval = 30, tooltip = "Plus grand = seulement les gros niveaux.")
+maxLvl   = input.int(4, "Nombre de niveaux gardés par côté", minval = 1, maxval = 8)
+showRes  = input.bool(true, "Afficher les RÉSISTANCES")
+showSup  = input.bool(true, "Afficher les SUPPORTS")
+showAsia = input.bool(true, "Afficher ASIA HIGH / LOW")
+asiaSess = input.session("0000-0700", "Session Asie (UTC)")
+
+// ─────────────────────── RÉSISTANCES / SUPPORTS ─────────────────────────────
+var array<line>  resLines = array.new<line>()
+var array<float> resLvls  = array.new<float>()
+var array<line>  supLines = array.new<line>()
+var array<float> supLvls  = array.new<float>()
+
+ph  = ta.pivothigh(high, pivLen, pivLen)
+plv = ta.pivotlow(low, pivLen, pivLen)
+
+if showRes and not na(ph)
+    l = line.new(bar_index - pivLen, ph, bar_index, ph, extend = extend.right, color = color.new(color.red, 15), width = 2)
+    array.push(resLines, l)
+    array.push(resLvls, ph)
+    if array.size(resLines) > maxLvl
+        line.delete(array.shift(resLines))
+        array.shift(resLvls)
+
+if showSup and not na(plv)
+    l = line.new(bar_index - pivLen, plv, bar_index, plv, extend = extend.right, color = color.new(color.green, 15), width = 2)
+    array.push(supLines, l)
+    array.push(supLvls, plv)
+    if array.size(supLines) > maxLvl
+        line.delete(array.shift(supLines))
+        array.shift(supLvls)
+
+// Niveau cassé en clôture → il disparaît
+if array.size(resLvls) > 0
+    for i = array.size(resLvls) - 1 to 0
+        if close > array.get(resLvls, i)
+            line.delete(array.get(resLines, i))
+            array.remove(resLines, i)
+            array.remove(resLvls, i)
+
+if array.size(supLvls) > 0
+    for i = array.size(supLvls) - 1 to 0
+        if close < array.get(supLvls, i)
+            line.delete(array.get(supLines, i))
+            array.remove(supLines, i)
+            array.remove(supLvls, i)
+
+// ─────────────────────── ASIA HIGH / ASIA LOW ───────────────────────────────
+inAsia    = showAsia and not na(time(timeframe.period, asiaSess, "UTC"))
+asiaStart = inAsia and not inAsia[1]
+
+var float aHigh = na
+var float aLow  = na
+var line  aHiLn = na
+var line  aLoLn = na
+var label aHiLb = na
+var label aLoLb = na
+
+if asiaStart
+    line.delete(aHiLn)
+    line.delete(aLoLn)
+    label.delete(aHiLb)
+    label.delete(aLoLb)
+    aHigh := high
+    aLow  := low
+    aHiLn := line.new(bar_index, high, bar_index, high, color = color.new(color.yellow, 0), width = 2)
+    aLoLn := line.new(bar_index, low,  bar_index, low,  color = color.new(color.yellow, 0), width = 2)
+    aHiLb := label.new(bar_index, high, "ASIA HIGH", style = label.style_label_left, color = color.new(color.yellow, 20), textcolor = color.black, size = size.small)
+    aLoLb := label.new(bar_index, low,  "ASIA LOW",  style = label.style_label_left, color = color.new(color.yellow, 20), textcolor = color.black, size = size.small)
+
+if inAsia and not na(aHiLn)
+    aHigh := math.max(aHigh, high)
+    aLow  := math.min(aLow, low)
+    line.set_y1(aHiLn, aHigh)
+    line.set_y2(aHiLn, aHigh)
+    line.set_y1(aLoLn, aLow)
+    line.set_y2(aLoLn, aLow)
+    label.set_y(aHiLb, aHigh)
+    label.set_y(aLoLb, aLow)
+
+if not na(aHiLn)
+    line.set_x2(aHiLn, bar_index)
+    line.set_x2(aLoLn, bar_index)
+    label.set_x(aHiLb, bar_index)
+    label.set_x(aLoLb, bar_index)
+    label.set_text(aHiLb, "ASIA HIGH " + str.tostring(aHigh, format.mintick))
+    label.set_text(aLoLb, "ASIA LOW " + str.tostring(aLow, format.mintick))

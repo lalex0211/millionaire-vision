@@ -1,0 +1,188 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  GOLD ELITE 15M — LE bot final pour l'OR (XAUUSD) — 15 minutes
+//
+//  Philosophie : PEU de trades, mais UNIQUEMENT des gros mouvements confirmés.
+//  Pas d'entrée sans que TOUTES ces confirmations soient réunies :
+//
+//   ✔ 1. GROSSE BOUGIE D'IMPULSION : corps ≥ 1,2 × ATR (le marché frappe fort)
+//   ✔ 2. CASSURE DE STRUCTURE : clôture au-dessus du plus haut des 20
+//        dernières bougies (achat) / sous le plus bas (vente)
+//   ✔ 3. VOLUME : au moins 1,5 × le volume moyen (les institutions sont là)
+//   ✔ 4. TENDANCE ALIGNÉE : EMA 50 > EMA 200 en 15m ET prix > EMA 200 en 1H
+//        (achat) — miroir pour la vente
+//   ✔ 5. SESSION : Londres + New York uniquement
+//
+//  Une seule confirmation manque → PAS DE TRADE. Le bot sait attendre.
+//
+//  Sortie : SL = 1,5 × ATR, TP = 2× le risque, Break-Even à +1R,
+//  trailing ATR pour laisser courir les gros gagnants.
+//  Protection : 1 % de risque par trade, max 2 trades/jour, stop à -3 %/jour.
+//
+//  💡 Si les VENTES ne donnent rien au backtest : décoche simplement
+//     « Autoriser les VENTES » dans les réglages. L'or est haussier de
+//     nature — beaucoup de traders or ne prennent que les achats.
+// ═══════════════════════════════════════════════════════════════════════════
+
+strategy("GOLD ELITE 15M — Gros mouvements confirmés",
+     shorttitle = "GOLD-ELITE",
+     overlay = true,
+     initial_capital = 10000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 0.5,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_bars_back = 500)
+
+// ─────────────────────────── PARAMÈTRES ────────────────────────────────────
+grpConf  = "① Confirmations du gros mouvement"
+grpRisk  = "② Gestion du risque"
+grpGuard = "③ Protections"
+
+bigBody   = input.float(1.2, "Taille mini de la bougie d'impulsion (× ATR)", minval = 0.5, step = 0.1, group = grpConf, tooltip = "Le corps de la bougie doit faire au moins X fois l'ATR. Monte à 1.5 pour être encore plus sélectif.")
+structLen = input.int(20, "Cassure de structure (nb de bougies)", minval = 5, maxval = 50, group = grpConf, tooltip = "Le prix doit clôturer au-dessus du plus haut (ou sous le plus bas) des X dernières bougies.")
+volMult   = input.float(1.5, "Volume mini (× volume moyen)", minval = 1.0, step = 0.1, group = grpConf, tooltip = "Confirme que le mouvement est poussé par du vrai volume, pas du vide.")
+useVol    = input.bool(true, "Exiger la confirmation de volume", group = grpConf)
+
+riskPct   = input.float(1.0, "Risque par trade (% du capital)", minval = 0.1, maxval = 3, step = 0.1, group = grpRisk)
+slMult    = input.float(1.5, "Stop Loss (× ATR)", minval = 0.5, step = 0.1, group = grpRisk)
+rrRatio   = input.float(2.0, "Ratio Take Profit (R:R)", minval = 1.0, step = 0.25, group = grpRisk)
+trailMult = input.float(2.0, "Trailing stop (× ATR) après +1R", minval = 0.5, step = 0.1, group = grpRisk)
+
+maxPerDay  = input.int(2,     "Max trades par jour", minval = 1, maxval = 6, group = grpGuard)
+maxDayLoss = input.float(3.0, "Perte journalière max (%) — coupe-circuit", minval = 0.5, step = 0.5, group = grpGuard)
+sessStr    = input.session("0700-2030", "Sessions Londres + New York (UTC)", group = grpGuard)
+allowLong  = input.bool(true,  "Autoriser les ACHATS", group = grpGuard)
+allowShort = input.bool(false, "Autoriser les VENTES", group = grpGuard, tooltip = "Désactivé par défaut : sur l'or, les achats sur gros mouvements sont statistiquement plus fiables. Active et backteste si tu veux comparer.")
+
+// ─────────────────────────── INDICATEURS ───────────────────────────────────
+atrVal  = ta.atr(14)
+ema50   = ta.ema(close, 50)
+ema200  = ta.ema(close, 200)
+volAvg  = ta.sma(volume, 20)
+[htfC, htfE] = request.security(syminfo.tickerid, "60", [close, ta.ema(close, 200)], lookahead = barmerge.lookahead_off)
+
+inSession = not na(time(timeframe.period, sessStr, "UTC"))
+
+// ─────────────────────── PROTECTIONS JOURNALIÈRES ──────────────────────────
+newDay = ta.change(time("D")) != 0
+var int   tradesToday    = 0
+var float dayStartEquity = strategy.equity
+if newDay
+    tradesToday    := 0
+    dayStartEquity := strategy.equity
+
+dailyLossHit = strategy.equity <= dayStartEquity * (1 - maxDayLoss / 100)
+canTrade     = tradesToday < maxPerDay and not dailyLossHit and strategy.position_size == 0
+
+// ─────────────────── LES 5 CONFIRMATIONS DU GROS MOUVEMENT ──────────────────
+// ① Grosse bougie d'impulsion
+bodySize   = math.abs(close - open)
+bigBullBar = close > open and bodySize >= bigBody * atrVal
+bigBearBar = close < open and bodySize >= bigBody * atrVal
+
+// ② Cassure de structure (clôture au-delà des extrêmes récents)
+structHigh = ta.highest(high, structLen)[1]
+structLow  = ta.lowest(low, structLen)[1]
+breakUp    = close > structHigh
+breakDown  = close < structLow
+
+// ③ Volume institutionnel
+volOK = not useVol or volume >= volAvg * volMult
+
+// ④ Tendance alignée 15m + 1H
+trendUp   = ema50 > ema200 and close > ema200 and htfC > htfE
+trendDown = ema50 < ema200 and close < ema200 and htfC < htfE
+
+// ⑤ Session → inSession
+
+// SIGNAL FINAL : tout doit être vrai en même temps
+longSig  = allowLong  and canTrade and inSession and bigBullBar and breakUp   and volOK and trendUp
+shortSig = allowShort and canTrade and inSession and bigBearBar and breakDown and volOK and trendDown
+
+// Compteur de confirmations en direct (pour le tableau de bord)
+confLong = (bigBullBar ? 1 : 0) + (breakUp ? 1 : 0) + (volOK ? 1 : 0) + (trendUp ? 1 : 0) + (inSession ? 1 : 0)
+confShort = (bigBearBar ? 1 : 0) + (breakDown ? 1 : 0) + (volOK ? 1 : 0) + (trendDown ? 1 : 0) + (inSession ? 1 : 0)
+
+// ─────────────────────── GESTION DE POSITION ────────────────────────────────
+var float stopPrice = na
+var float tpPrice   = na
+var float riskDist  = na
+
+calcQty(slDistance) =>
+    riskMoney = strategy.equity * riskPct / 100
+    math.max(riskMoney / slDistance, 0.01)
+
+if longSig
+    riskDist  := atrVal * slMult
+    stopPrice := close - riskDist
+    tpPrice   := close + riskDist * rrRatio
+    q = calcQty(riskDist)
+    msgLong = '{"bot":"GOLD_ELITE","action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp":' + str.tostring(tpPrice, format.mintick) + '}'
+    strategy.entry("ACHAT", strategy.long, qty = q, alert_message = msgLong)
+    tradesToday += 1
+
+if shortSig
+    riskDist  := atrVal * slMult
+    stopPrice := close + riskDist
+    tpPrice   := close - riskDist * rrRatio
+    q = calcQty(riskDist)
+    msgShort = '{"bot":"GOLD_ELITE","action":"sell","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp":' + str.tostring(tpPrice, format.mintick) + '}'
+    strategy.entry("VENTE", strategy.short, qty = q, alert_message = msgShort)
+    tradesToday += 1
+
+// Break-Even à +1R puis trailing ATR (on laisse courir les gros gagnants)
+if strategy.position_size > 0
+    entryP = strategy.position_avg_price
+    if high >= entryP + riskDist
+        stopPrice := math.max(stopPrice, entryP + syminfo.mintick * 10)
+        stopPrice := math.max(stopPrice, close - atrVal * trailMult)
+
+if strategy.position_size < 0
+    entryP = strategy.position_avg_price
+    if low <= entryP - riskDist
+        stopPrice := math.min(stopPrice, entryP - syminfo.mintick * 10)
+        stopPrice := math.min(stopPrice, close + atrVal * trailMult)
+
+if strategy.position_size > 0
+    strategy.exit("SORTIE-A", from_entry = "ACHAT", stop = stopPrice, limit = tpPrice, alert_message = '{"bot":"GOLD_ELITE","action":"close_buy","symbol":"' + syminfo.ticker + '"}')
+if strategy.position_size < 0
+    strategy.exit("SORTIE-V", from_entry = "VENTE", stop = stopPrice, limit = tpPrice, alert_message = '{"bot":"GOLD_ELITE","action":"close_sell","symbol":"' + syminfo.ticker + '"}')
+
+// ─────────────────────────── AFFICHAGE ─────────────────────────────────────
+plot(ema50,  "EMA 50",  color = color.new(color.aqua, 30),  linewidth = 1)
+plot(ema200, "EMA 200", color = trendUp ? color.new(color.green, 20) : trendDown ? color.new(color.red, 20) : color.new(color.gray, 40), linewidth = 2)
+plot(structHigh, "Structure haute", color = color.new(color.yellow, 60), style = plot.style_stepline)
+plot(structLow,  "Structure basse", color = color.new(color.yellow, 60), style = plot.style_stepline)
+
+plotshape(longSig,  "ACHAT confirmé", shape.triangleup,   location.belowbar, color.new(color.green, 0), size = size.normal, text = "ACHAT\n5/5")
+plotshape(shortSig, "VENTE confirmée", shape.triangledown, location.abovebar, color.new(color.red, 0),  size = size.normal, text = "VENTE\n5/5")
+
+plot(strategy.position_size != 0 ? stopPrice : na, "Stop Loss",   color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size != 0 ? tpPrice   : na, "Take Profit", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
+
+bgcolor(dailyLossHit ? color.new(color.red, 88) : na, title = "Coupe-circuit journalier")
+
+// ─────────────────────── TABLEAU DE BORD ───────────────────────────────────
+var table dash = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 60))
+if barstate.islast
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+    table.cell(dash, 0, 0, "GOLD ELITE 15M", text_color = color.yellow, text_size = size.small)
+    table.cell(dash, 1, 0, trendUp ? "TENDANCE ↑ ACHAT" : trendDown ? "TENDANCE ↓ VENTE" : "NEUTRE — patience", text_color = trendUp ? color.green : trendDown ? color.red : color.gray, text_size = size.small)
+    table.cell(dash, 0, 1, "Confirmations ACHAT", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 1, str.tostring(confLong) + " / 5", text_color = confLong >= 4 ? color.green : color.gray, text_size = size.tiny)
+    table.cell(dash, 0, 2, "Confirmations VENTE", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 2, str.tostring(confShort) + " / 5", text_color = confShort >= 4 ? color.red : color.gray, text_size = size.tiny)
+    table.cell(dash, 0, 3, "Trades fermés", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 3, str.tostring(strategy.closedtrades), text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 0, 4, "Taux de réussite", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 4, str.tostring(winRate, "#.#") + " %", text_color = winRate >= 45 ? color.green : color.orange, text_size = size.tiny)
+    table.cell(dash, 0, 5, "Profit Factor", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 5, str.tostring(pf, "#.##"), text_color = pf >= 1.3 ? color.green : color.orange, text_size = size.tiny)
+    table.cell(dash, 0, 6, "Trades aujourd'hui", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 6, str.tostring(tradesToday) + " / " + str.tostring(maxPerDay), text_color = tradesToday >= maxPerDay ? color.red : color.white, text_size = size.tiny)

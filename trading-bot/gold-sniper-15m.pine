@@ -1,0 +1,184 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  GOLD SNIPER 15M — Bot de trading autonome pour l'OR (XAUUSD / GOLD)
+//  Timeframe : 15 minutes | Achat + Vente | Gestion du risque intégrée
+//
+//  Logique :
+//   1. Tendance de fond : EMA 200 (15m) + confirmation EMA 200 en 1H
+//   2. Signal d'entrée : croisement EMA 9/21 dans le sens de la tendance
+//   3. Filtres : RSI (momentum sain), ADX (marché qui bouge vraiment),
+//      sessions Londres + New York uniquement (là où l'or bouge)
+//   4. Sortie : Stop Loss basé sur l'ATR, Take Profit ratio 2:1,
+//      passage à Break-Even automatique, trailing stop ATR
+//   5. Protection : risque % fixe par trade, max trades/jour,
+//      coupe-circuit de perte journalière
+// ═══════════════════════════════════════════════════════════════════════════
+
+strategy("GOLD SNIPER 15M — XAUUSD",
+     shorttitle = "GOLD15",
+     overlay = true,
+     initial_capital = 10000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 0.5,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_bars_back = 500)
+
+// ─────────────────────────── PARAMÈTRES ────────────────────────────────────
+grpTrend  = "① Tendance"
+grpEntry  = "② Signal d'entrée"
+grpRisk   = "③ Gestion du risque"
+grpGuard  = "④ Protections journalières"
+grpSess   = "⑤ Sessions de trading (UTC)"
+grpDir    = "⑥ Direction"
+
+lenFast    = input.int(9,    "EMA rapide",              minval = 2,  group = grpEntry)
+lenSlow    = input.int(21,   "EMA lente",               minval = 5,  group = grpEntry)
+lenTrend   = input.int(200,  "EMA tendance (15m)",      minval = 50, group = grpTrend)
+htfTf      = input.timeframe("60", "Unité de temps de confirmation", group = grpTrend)
+lenHtf     = input.int(200,  "EMA tendance (UT supérieure)", minval = 50, group = grpTrend)
+
+rsiLen     = input.int(14,   "Longueur RSI",            minval = 2,  group = grpEntry)
+rsiBuyMin  = input.float(50, "RSI mini pour ACHAT",     group = grpEntry)
+rsiBuyMax  = input.float(70, "RSI maxi pour ACHAT (anti-surachat)", group = grpEntry)
+adxMin     = input.float(20, "ADX minimum (force du marché)", minval = 5, group = grpEntry)
+
+riskPct    = input.float(1.0, "Risque par trade (% du capital)", minval = 0.1, maxval = 5, step = 0.1, group = grpRisk)
+atrLen     = input.int(14,    "Longueur ATR",           minval = 2, group = grpRisk)
+slMult     = input.float(1.5, "Stop Loss (× ATR)",      minval = 0.5, step = 0.1, group = grpRisk)
+rrRatio    = input.float(2.0, "Ratio Take Profit (R:R)", minval = 1.0, step = 0.25, group = grpRisk)
+useBE      = input.bool(true, "Break-Even automatique à +1R", group = grpRisk)
+useTrail   = input.bool(true, "Trailing stop ATR après +1R",  group = grpRisk)
+trailMult  = input.float(2.0, "Trailing (× ATR)",       minval = 0.5, step = 0.1, group = grpRisk)
+
+maxPerDay  = input.int(3,     "Max trades par jour",    minval = 1, maxval = 10, group = grpGuard)
+maxDayLoss = input.float(3.0, "Perte journalière max (%) — coupe-circuit", minval = 0.5, step = 0.5, group = grpGuard)
+
+useSess    = input.bool(true, "Trader uniquement Londres + New York", group = grpSess)
+sessStr    = input.session("0700-2030", "Plage horaire (UTC)", group = grpSess)
+
+allowLong  = input.bool(true, "Autoriser les ACHATS",  group = grpDir)
+allowShort = input.bool(true, "Autoriser les VENTES",  group = grpDir)
+
+// ─────────────────────────── INDICATEURS ───────────────────────────────────
+emaFast  = ta.ema(close, lenFast)
+emaSlow  = ta.ema(close, lenSlow)
+emaTrend = ta.ema(close, lenTrend)
+rsiVal   = ta.rsi(close, rsiLen)
+atrVal   = ta.atr(atrLen)
+[diPlus, diMinus, adxVal] = ta.dmi(14, 14)
+
+// Confirmation multi-timeframe (1H par défaut)
+[htfClose, htfEma] = request.security(syminfo.tickerid, htfTf, [close, ta.ema(close, lenHtf)], lookahead = barmerge.lookahead_off)
+
+bullTrend = close > emaTrend and htfClose > htfEma
+bearTrend = close < emaTrend and htfClose < htfEma
+
+// Session
+inSession = not useSess or not na(time(timeframe.period, sessStr, "UTC"))
+
+// ─────────────────────── PROTECTIONS JOURNALIÈRES ───────────────────────────
+newDay = ta.change(time("D")) != 0
+var int   tradesToday    = 0
+var float dayStartEquity = strategy.equity
+if newDay
+    tradesToday    := 0
+    dayStartEquity := strategy.equity
+
+dailyLossHit = strategy.equity <= dayStartEquity * (1 - maxDayLoss / 100)
+canTrade     = tradesToday < maxPerDay and not dailyLossHit and strategy.position_size == 0
+
+// ─────────────────────────── SIGNAUX ───────────────────────────────────────
+crossUp   = ta.crossover(emaFast, emaSlow)
+crossDown = ta.crossunder(emaFast, emaSlow)
+
+longSig  = allowLong  and canTrade and inSession and bullTrend and crossUp   and rsiVal > rsiBuyMin and rsiVal < rsiBuyMax and adxVal > adxMin
+shortSig = allowShort and canTrade and inSession and bearTrend and crossDown and rsiVal < (100 - rsiBuyMin) and rsiVal > (100 - rsiBuyMax) and adxVal > adxMin
+
+// ─────────────────────── GESTION DE POSITION ───────────────────────────────
+var float stopPrice = na
+var float tpPrice   = na
+var float riskDist  = na
+
+// Taille de position : risque fixe en % du capital
+calcQty(slDistance) =>
+    riskMoney = strategy.equity * riskPct / 100
+    qty = riskMoney / slDistance
+    math.max(qty, 0.01)
+
+if longSig
+    riskDist  := atrVal * slMult
+    stopPrice := close - riskDist
+    tpPrice   := close + riskDist * rrRatio
+    q = calcQty(riskDist)
+    msgLong = '{"bot":"GOLD_SNIPER_15M","action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp":' + str.tostring(tpPrice, format.mintick) + ',"risk_pct":' + str.tostring(riskPct) + '}'
+    strategy.entry("ACHAT", strategy.long, qty = q, alert_message = msgLong)
+    tradesToday += 1
+
+if shortSig
+    riskDist  := atrVal * slMult
+    stopPrice := close + riskDist
+    tpPrice   := close - riskDist * rrRatio
+    q = calcQty(riskDist)
+    msgShort = '{"bot":"GOLD_SNIPER_15M","action":"sell","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp":' + str.tostring(tpPrice, format.mintick) + ',"risk_pct":' + str.tostring(riskPct) + '}'
+    strategy.entry("VENTE", strategy.short, qty = q, alert_message = msgShort)
+    tradesToday += 1
+
+// Break-even + trailing stop pendant la position
+if strategy.position_size > 0
+    entryP = strategy.position_avg_price
+    if useBE and high >= entryP + riskDist
+        stopPrice := math.max(stopPrice, entryP + syminfo.mintick * 10)
+    if useTrail and high >= entryP + riskDist
+        stopPrice := math.max(stopPrice, close - atrVal * trailMult)
+
+if strategy.position_size < 0
+    entryP = strategy.position_avg_price
+    if useBE and low <= entryP - riskDist
+        stopPrice := math.min(stopPrice, entryP - syminfo.mintick * 10)
+    if useTrail and low <= entryP - riskDist
+        stopPrice := math.min(stopPrice, close + atrVal * trailMult)
+
+msgCloseLong  = '{"bot":"GOLD_SNIPER_15M","action":"close_buy","symbol":"' + syminfo.ticker + '"}'
+msgCloseShort = '{"bot":"GOLD_SNIPER_15M","action":"close_sell","symbol":"' + syminfo.ticker + '"}'
+
+if strategy.position_size > 0
+    strategy.exit("SORTIE-A", from_entry = "ACHAT", stop = stopPrice, limit = tpPrice, alert_message = msgCloseLong)
+if strategy.position_size < 0
+    strategy.exit("SORTIE-V", from_entry = "VENTE", stop = stopPrice, limit = tpPrice, alert_message = msgCloseShort)
+
+// ─────────────────────────── AFFICHAGE ─────────────────────────────────────
+plot(emaFast,  "EMA rapide",   color = color.new(color.aqua, 0),   linewidth = 1)
+plot(emaSlow,  "EMA lente",    color = color.new(color.orange, 0), linewidth = 1)
+plot(emaTrend, "EMA 200",      color = bullTrend ? color.new(color.green, 20) : bearTrend ? color.new(color.red, 20) : color.new(color.gray, 40), linewidth = 2)
+
+plotshape(longSig,  "Signal ACHAT", shape.triangleup,   location.belowbar, color.new(color.green, 0), size = size.small, text = "ACHAT")
+plotshape(shortSig, "Signal VENTE", shape.triangledown, location.abovebar, color.new(color.red, 0),   size = size.small, text = "VENTE")
+
+plot(strategy.position_size != 0 ? stopPrice : na, "Stop Loss",   color = color.new(color.red, 0),   style = plot.style_linebr)
+plot(strategy.position_size != 0 ? tpPrice   : na, "Take Profit", color = color.new(color.green, 0), style = plot.style_linebr)
+
+bgcolor(inSession and useSess ? color.new(color.blue, 96) : na, title = "Session active")
+bgcolor(dailyLossHit ? color.new(color.red, 88) : na, title = "Coupe-circuit journalier")
+
+// ─────────────────────── TABLEAU DE BORD ───────────────────────────────────
+var table dash = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 20), border_width = 1, border_color = color.new(color.gray, 60))
+if barstate.islast
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+    table.cell(dash, 0, 0, "GOLD SNIPER 15M", text_color = color.yellow, text_size = size.small)
+    table.cell(dash, 1, 0, bullTrend ? "TENDANCE ↑" : bearTrend ? "TENDANCE ↓" : "NEUTRE", text_color = bullTrend ? color.green : bearTrend ? color.red : color.gray, text_size = size.small)
+    table.cell(dash, 0, 1, "Trades fermés", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 1, str.tostring(strategy.closedtrades), text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 0, 2, "Taux de réussite", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 2, str.tostring(winRate, "#.#") + " %", text_color = winRate >= 45 ? color.green : color.orange, text_size = size.tiny)
+    table.cell(dash, 0, 3, "Profit Factor", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 3, str.tostring(pf, "#.##"), text_color = pf >= 1.3 ? color.green : color.orange, text_size = size.tiny)
+    table.cell(dash, 0, 4, "P&L net", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 4, str.tostring(strategy.netprofit, "#.##") + " $", text_color = strategy.netprofit >= 0 ? color.green : color.red, text_size = size.tiny)
+    table.cell(dash, 0, 5, "Trades aujourd'hui", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 5, str.tostring(tradesToday) + " / " + str.tostring(maxPerDay), text_color = tradesToday >= maxPerDay ? color.red : color.white, text_size = size.tiny)

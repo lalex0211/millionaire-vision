@@ -1,0 +1,498 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  GOLD LIVE 15M — Détection EN TEMPS RÉEL — OR (XAUUSD) — 15 minutes
+//
+//  DÈS QU'UNE BOUGIE CLÔTURE et crée quelque chose, le bot LE DIT DIRECT :
+//   • FVG ↑ / FVG ↓        → étiquette sur la bougie + boîte + ALERTE
+//   • OB ↑ / OB ↓          → étiquette sur la bougie + boîte + ALERTE
+//   • SWEEP (liquidité)     → étiquette sur la bougie + ALERTE
+//   • BOS / CHoCH           → ligne + étiquette + ALERTE
+//   • ACHAT / VENTE         → étiquette complète avec SL, TP1, TP2 + ALERTE
+//
+//  ⚠ POUR RECEVOIR LES MESSAGES EN DIRECT : crée UNE alerte TradingView sur
+//    ce script avec la condition « Toute fonction alert() » (Any alert()
+//    function call). Chaque événement t'enverra son propre message.
+//
+//  ENTRÉE (le bot trade tout seul) :
+//   Structure dans le bon sens (BOS/CHoCH) + LA BONNE BOUGIE
+//   (ENGLOBANTE / PIN BAR / IMPULSION) + au moins 2 parmi :
+//   sweep de liquidité récent, zone OB/FVG respectée, volume fort.
+//
+//  SORTIE : SL derrière la bougie, TP1 = 1R (ferme 50 % + Break-Even),
+//  TP2 = 2,5R (objectif final), trailing ATR après TP1.
+// ═══════════════════════════════════════════════════════════════════════════
+
+strategy("GOLD LIVE 15M — Temps réel FVG/OB/SWEEP",
+     shorttitle = "GOLD-LIVE",
+     overlay = true,
+     initial_capital = 10000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 0.5,
+     slippage = 2,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_labels_count = 500,
+     max_lines_count = 500,
+     max_boxes_count = 500,
+     max_bars_back = 500)
+
+// ─────────────────────────── PARAMÈTRES ────────────────────────────────────
+grpDet   = "① Détection temps réel"
+grpConf  = "② Confirmations d'entrée"
+grpRisk  = "③ Gestion du risque"
+grpGuard = "④ Protections"
+
+fvgMin   = input.float(0.3, "Taille mini d'un FVG (× ATR)", minval = 0.1, step = 0.05, group = grpDet)
+dispOB   = input.float(1.2, "Impulsion mini pour un OB (× ATR)", minval = 0.5, step = 0.1, group = grpDet)
+maxZones = input.int(4, "Zones OB/FVG actives max par sens", minval = 2, maxval = 8, group = grpDet)
+liqLen   = input.int(20, "Fenêtre des extrêmes pour le SWEEP", minval = 5, maxval = 60, group = grpDet)
+pivLen   = input.int(5, "Sensibilité des swings (BOS/CHoCH)", minval = 2, maxval = 15, group = grpDet)
+maxKeep  = input.int(2, "Nb de BOS/CHoCH affichés", minval = 1, maxval = 6, group = grpDet)
+
+dispTrig   = input.float(1.2, "Taille de la bougie IMPULSION (× ATR)", minval = 0.5, step = 0.1, group = grpConf)
+volMult    = input.float(1.3, "Volume mini (× moyenne)", minval = 1.0, step = 0.1, group = grpConf)
+confWindow = input.int(5, "Fenêtre de confluence (bougies)", minval = 1, maxval = 12, group = grpConf)
+minExtra   = input.int(2, "Confirmations mini parmi SWEEP / ZONE / VOLUME", minval = 1, maxval = 3, group = grpConf)
+
+riskPct   = input.float(1.0, "Risque par trade (% du capital)", minval = 0.1, maxval = 3, step = 0.1, group = grpRisk)
+slPad     = input.float(0.3, "Marge du SL derrière la bougie (× ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+tp1RR     = input.float(1.0, "TP1 = × le risque (prise partielle)", minval = 0.5, step = 0.25, group = grpRisk)
+tp1Pct    = input.float(50,  "% fermé au TP1", minval = 10, maxval = 90, step = 5, group = grpRisk)
+tp2RR     = input.float(2.5, "TP2 = × le risque (objectif final)", minval = 1.0, step = 0.25, group = grpRisk)
+trailMult = input.float(2.0, "Trailing stop (× ATR) après TP1", minval = 0.5, step = 0.1, group = grpRisk)
+
+maxPerDay  = input.int(2,     "Max trades par jour", minval = 1, maxval = 6, group = grpGuard)
+maxDayLoss = input.float(3.0, "Perte journalière max (%)", minval = 0.5, step = 0.5, group = grpGuard)
+useSess    = input.bool(true, "Trader uniquement Londres + New York", group = grpGuard)
+sessStr    = input.session("0700-2030", "Plage horaire (UTC)", group = grpGuard)
+allowLong  = input.bool(true, "Autoriser les ACHATS", group = grpGuard)
+allowShort = input.bool(true, "Autoriser les VENTES", group = grpGuard)
+
+grpSR = "⑤ Supports / Résistances + Asie"
+showSR   = input.bool(true, "Afficher les supports / résistances", group = grpSR)
+pivSR    = input.int(10, "Sensibilité des S/R (pivots)", minval = 3, maxval = 30, group = grpSR)
+maxSR    = input.int(4, "Nombre de niveaux S/R par côté", minval = 2, maxval = 8, group = grpSR)
+showAsia = input.bool(true, "Afficher le High/Low de l'Asie", group = grpSR)
+asiaSess = input.session("0000-0700", "Session Asie (UTC)", group = grpSR)
+
+// ─────────────────────────── OUTILS ────────────────────────────────────────
+atrVal = ta.atr(14)
+volAvg = ta.sma(volume, 20)
+inSession = not useSess or not na(time(timeframe.period, sessStr, "UTC"))
+
+newDay = ta.change(time("D")) != 0
+var int   tradesToday    = 0
+var float dayStartEquity = strategy.equity
+if newDay
+    tradesToday    := 0
+    dayStartEquity := strategy.equity
+
+dailyLossHit = strategy.equity <= dayStartEquity * (1 - maxDayLoss / 100)
+canTrade     = tradesToday < maxPerDay and not dailyLossHit and strategy.position_size == 0
+
+// Mémoire du dernier événement (pour le panneau)
+var string lastEvt    = "—"
+var int    lastEvtBar = na
+sayEvent(string txt) =>
+    alert(txt + " | " + syminfo.ticker + " 15m | prix " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+// ═══════════════ STRUCTURE : BOS / CHoCH ════════════════════════════════════
+ph  = ta.pivothigh(high, pivLen, pivLen)
+plv = ta.pivotlow(low, pivLen, pivLen)
+
+var float lastSH = na
+var int   lastSHbar = na
+var float lastSL = na
+var int   lastSLbar = na
+var int   trend  = 0
+
+var array<line>  structLines = array.new<line>()
+var array<label> structLabs  = array.new<label>()
+
+if not na(ph)
+    lastSH := ph
+    lastSHbar := bar_index - pivLen
+if not na(plv)
+    lastSL := plv
+    lastSLbar := bar_index - pivLen
+
+addStructMark(int x1, float y, string evt, bool up) =>
+    col = up ? color.new(color.green, 0) : color.new(color.red, 0)
+    ln = line.new(x1, y, bar_index, y, color = col, width = 2, style = evt == "BOS" ? line.style_solid : line.style_dashed)
+    lb = label.new(bar_index, y, evt + (up ? " ↑" : " ↓"), style = up ? label.style_label_down : label.style_label_up, color = color.new(up ? color.green : color.red, evt == "BOS" ? 60 : 20), textcolor = color.white, size = size.small)
+    array.push(structLines, ln)
+    array.push(structLabs, lb)
+    if array.size(structLines) > maxKeep
+        line.delete(array.shift(structLines))
+        label.delete(array.shift(structLabs))
+
+if not na(lastSH) and close > lastSH
+    evt = trend == 1 ? "BOS" : "CHoCH"
+    addStructMark(lastSHbar, lastSH, evt, true)
+    trend := 1
+    lastEvt := evt + " ↑ (structure haussière)"
+    lastEvtBar := bar_index
+    sayEvent("📈 " + evt + " HAUSSIER — la structure casse vers le HAUT")
+    lastSH := na
+
+if not na(lastSL) and close < lastSL
+    evt = trend == -1 ? "BOS" : "CHoCH"
+    addStructMark(lastSLbar, lastSL, evt, false)
+    trend := -1
+    lastEvt := evt + " ↓ (structure baissière)"
+    lastEvtBar := bar_index
+    sayEvent("📉 " + evt + " BAISSIER — la structure casse vers le BAS")
+    lastSL := na
+
+// ═══════════════ SWEEP DE LIQUIDITÉ (annoncé en direct) ═════════════════════
+prevLowN  = ta.lowest(low, liqLen)[1]
+prevHighN = ta.highest(high, liqLen)[1]
+sweepBullNow = low < prevLowN and close > prevLowN     // stops chassés SOUS les creux
+sweepBearNow = high > prevHighN and close < prevHighN  // stops chassés SUR les sommets
+
+var int sweepBullBar = na
+var int sweepBearBar = na
+if sweepBullNow
+    sweepBullBar := bar_index
+    lastEvt := "SWEEP de liquidité (bas) → achat possible"
+    lastEvtBar := bar_index
+    sayEvent("💧 SWEEP LIQUIDITÉ BAS — mèche sous les creux + rejet (signal ACHAT potentiel)")
+if sweepBearNow
+    sweepBearBar := bar_index
+    lastEvt := "SWEEP de liquidité (haut) → vente possible"
+    lastEvtBar := bar_index
+    sayEvent("💧 SWEEP LIQUIDITÉ HAUT — mèche sur les sommets + rejet (signal VENTE potentiel)")
+
+plotshape(sweepBullNow, "SWEEP bas",  shape.labelup,   location.belowbar, color.new(color.fuchsia, 0), size = size.tiny, text = "SWEEP", textcolor = color.white)
+plotshape(sweepBearNow, "SWEEP haut", shape.labeldown, location.abovebar, color.new(color.fuchsia, 0), size = size.tiny, text = "SWEEP", textcolor = color.white)
+
+// ═══════════════ FVG + OB : créés et annoncés À LA CLÔTURE ══════════════════
+var array<box> bullZones = array.new<box>()
+var array<box> bearZones = array.new<box>()
+var int zoneLbar = na
+var int zoneSbar = na
+
+addZone(array<box> arr, int leftBar, float top, float bottom, color bg, color bord, string txt) =>
+    b = box.new(leftBar, top, bar_index, bottom, border_color = bord, bgcolor = bg, extend = extend.right, text = txt, text_color = bord, text_size = size.tiny, text_halign = text.align_left)
+    array.push(arr, b)
+    if array.size(arr) > maxZones
+        box.delete(array.shift(arr))
+
+// D'abord : le prix RESPECTE une zone existante ? (jamais la bougie de création)
+if array.size(bullZones) > 0
+    for i = array.size(bullZones) - 1 to 0
+        b   = array.get(bullZones, i)
+        t   = box.get_top(b)
+        btm = box.get_bottom(b)
+        if close < btm
+            box.set_extend(b, extend.none)
+            box.set_right(b, bar_index)
+            box.set_bgcolor(b, color.new(color.gray, 92))
+            array.remove(bullZones, i)
+        else if low <= t and close > t and close > open
+            zoneLbar := bar_index
+            lastEvt := "Zone OB/FVG haussière respectée"
+            lastEvtBar := bar_index
+            sayEvent("✅ ZONE HAUSSIÈRE RESPECTÉE — le prix a rejeté la zone (confirmation ACHAT)")
+            box.set_extend(b, extend.none)
+            box.set_right(b, bar_index)
+            array.remove(bullZones, i)
+
+if array.size(bearZones) > 0
+    for i = array.size(bearZones) - 1 to 0
+        b   = array.get(bearZones, i)
+        t   = box.get_top(b)
+        btm = box.get_bottom(b)
+        if close > t
+            box.set_extend(b, extend.none)
+            box.set_right(b, bar_index)
+            box.set_bgcolor(b, color.new(color.gray, 92))
+            array.remove(bearZones, i)
+        else if high >= btm and close < btm and close < open
+            zoneSbar := bar_index
+            lastEvt := "Zone OB/FVG baissière respectée"
+            lastEvtBar := bar_index
+            sayEvent("✅ ZONE BAISSIÈRE RESPECTÉE — le prix a rejeté la zone (confirmation VENTE)")
+            box.set_extend(b, extend.none)
+            box.set_right(b, bar_index)
+            array.remove(bearZones, i)
+
+// Ensuite : création — annoncée DIRECT à la clôture de la bougie
+newBullOB  = close > open and (close - open) >= dispOB * atrVal and close > high[1] and close[1] < open[1]
+newBearOB  = close < open and (open - close) >= dispOB * atrVal and close < low[1] and close[1] > open[1]
+newBullFVG = low > high[2] and (low - high[2]) >= fvgMin * atrVal
+newBearFVG = high < low[2] and (low[2] - high) >= fvgMin * atrVal
+
+if newBullOB
+    addZone(bullZones, bar_index - 1, high[1], low[1], color.new(color.green, 85), color.new(color.green, 40), "OB ↑")
+    lastEvt := "OB haussier créé"
+    lastEvtBar := bar_index
+    sayEvent("🟩 ORDER BLOCK HAUSSIER créé — cette bougie vient de fabriquer un OB d'achat")
+if newBearOB
+    addZone(bearZones, bar_index - 1, high[1], low[1], color.new(color.red, 85), color.new(color.red, 40), "OB ↓")
+    lastEvt := "OB baissier créé"
+    lastEvtBar := bar_index
+    sayEvent("🟥 ORDER BLOCK BAISSIER créé — cette bougie vient de fabriquer un OB de vente")
+if newBullFVG
+    addZone(bullZones, bar_index - 2, low, high[2], color.new(color.teal, 88), color.new(color.teal, 45), "FVG ↑")
+    lastEvt := "FVG haussier créé"
+    lastEvtBar := bar_index
+    sayEvent("🟦 FVG HAUSSIER créé — trou de liquidité sous le prix (zone d'achat)")
+if newBearFVG
+    addZone(bearZones, bar_index - 2, low[2], high, color.new(color.orange, 88), color.new(color.orange, 45), "FVG ↓")
+    lastEvt := "FVG baissier créé"
+    lastEvtBar := bar_index
+    sayEvent("🟧 FVG BAISSIER créé — trou de liquidité au-dessus du prix (zone de vente)")
+
+// Étiquettes DIRECT sur la bougie qui crée l'événement
+plotshape(newBullOB,  "OB↑ créé",  shape.labelup,   location.belowbar, color.new(color.green, 20),  size = size.tiny, text = "OB↑",  textcolor = color.white)
+plotshape(newBearOB,  "OB↓ créé",  shape.labeldown, location.abovebar, color.new(color.red, 20),    size = size.tiny, text = "OB↓",  textcolor = color.white)
+plotshape(newBullFVG, "FVG↑ créé", shape.labelup,   location.belowbar, color.new(color.teal, 20),   size = size.tiny, text = "FVG↑", textcolor = color.white)
+plotshape(newBearFVG, "FVG↓ créé", shape.labeldown, location.abovebar, color.new(color.orange, 20), size = size.tiny, text = "FVG↓", textcolor = color.white)
+
+// ═══════════════ LA BONNE BOUGIE + VOLUME ═══════════════════════════════════
+rng     = math.max(high - low, syminfo.mintick)
+lowWick = math.min(open, close) - low
+upWick  = high - math.max(open, close)
+
+bullEngulf = close > open and close[1] < open[1] and close >= high[1] and open <= close[1]
+bearEngulf = close < open and close[1] > open[1] and close <= low[1] and open >= close[1]
+bullPin    = lowWick >= 0.6 * rng and close >= high - 0.4 * rng
+bearPin    = upWick >= 0.6 * rng and close <= low + 0.4 * rng
+bullDisp   = close > open and (close - open) >= dispTrig * atrVal
+bearDisp   = close < open and (open - close) >= dispTrig * atrVal
+
+triggerBullTxt = bullEngulf ? "ENGLOBANTE" : bullPin ? "PIN BAR" : bullDisp ? "IMPULSION" : ""
+triggerBearTxt = bearEngulf ? "ENGLOBANTE" : bearPin ? "PIN BAR" : bearDisp ? "IMPULSION" : ""
+triggerBull = triggerBullTxt != ""
+triggerBear = triggerBearTxt != ""
+
+volOK = volume >= volAvg * volMult
+
+// ═══════════════ CONFLUENCE + ENTRÉES ═══════════════════════════════════════
+recent(int b) =>
+    not na(b) and bar_index - b <= confWindow
+
+confSweepL = recent(sweepBullBar)
+confSweepS = recent(sweepBearBar)
+confZoneL  = recent(zoneLbar)
+confZoneS  = recent(zoneSbar)
+
+extraL = (confSweepL ? 1 : 0) + (confZoneL ? 1 : 0) + (volOK ? 1 : 0)
+extraS = (confSweepS ? 1 : 0) + (confZoneS ? 1 : 0) + (volOK ? 1 : 0)
+
+longSig  = allowLong  and canTrade and inSession and trend == 1  and triggerBull and extraL >= minExtra
+shortSig = allowShort and canTrade and inSession and trend == -1 and triggerBear and extraS >= minExtra
+
+var float stopPrice = na
+var float tp1Price  = na
+var float tp2Price  = na
+var float riskDist  = na
+
+calcQty(slDistance) =>
+    math.max((strategy.equity * riskPct / 100) / slDistance, 0.01)
+
+if longSig
+    stopPrice := low - atrVal * slPad
+    riskDist  := math.max(close - stopPrice, 0.5 * atrVal)
+    tp1Price  := close + riskDist * tp1RR
+    tp2Price  := close + riskDist * tp2RR
+    q = calcQty(riskDist)
+    strategy.entry("ACHAT", strategy.long, qty = q, alert_message = '{"bot":"GOLD_LIVE","action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp1":' + str.tostring(tp1Price, format.mintick) + ',"tp2":' + str.tostring(tp2Price, format.mintick) + ',"bougie":"' + triggerBullTxt + '"}')
+    label.new(bar_index, low - atrVal, "ACHAT ▲ " + triggerBullTxt + (confSweepL ? " + SWEEP" : "") + (confZoneL ? " + ZONE" : "") + (volOK ? " + VOL" : "") + "\nSL  " + str.tostring(stopPrice, format.mintick) + "\nTP1 " + str.tostring(tp1Price, format.mintick) + "\nTP2 " + str.tostring(tp2Price, format.mintick), style = label.style_label_up, color = color.new(color.green, 10), textcolor = color.white, size = size.small)
+    sayEvent("🚀 ACHAT CONFIRMÉ (" + triggerBullTxt + ") — SL " + str.tostring(stopPrice, format.mintick) + " | TP1 " + str.tostring(tp1Price, format.mintick) + " | TP2 " + str.tostring(tp2Price, format.mintick))
+    tradesToday += 1
+    sweepBullBar := na
+    zoneLbar := na
+
+if shortSig
+    stopPrice := high + atrVal * slPad
+    riskDist  := math.max(stopPrice - close, 0.5 * atrVal)
+    tp1Price  := close - riskDist * tp1RR
+    tp2Price  := close - riskDist * tp2RR
+    q = calcQty(riskDist)
+    strategy.entry("VENTE", strategy.short, qty = q, alert_message = '{"bot":"GOLD_LIVE","action":"sell","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(stopPrice, format.mintick) + ',"tp1":' + str.tostring(tp1Price, format.mintick) + ',"tp2":' + str.tostring(tp2Price, format.mintick) + ',"bougie":"' + triggerBearTxt + '"}')
+    label.new(bar_index, high + atrVal, "VENTE ▼ " + triggerBearTxt + (confSweepS ? " + SWEEP" : "") + (confZoneS ? " + ZONE" : "") + (volOK ? " + VOL" : "") + "\nSL  " + str.tostring(stopPrice, format.mintick) + "\nTP1 " + str.tostring(tp1Price, format.mintick) + "\nTP2 " + str.tostring(tp2Price, format.mintick), style = label.style_label_down, color = color.new(color.red, 10), textcolor = color.white, size = size.small)
+    sayEvent("🔻 VENTE CONFIRMÉE (" + triggerBearTxt + ") — SL " + str.tostring(stopPrice, format.mintick) + " | TP1 " + str.tostring(tp1Price, format.mintick) + " | TP2 " + str.tostring(tp2Price, format.mintick))
+    tradesToday += 1
+    sweepBearBar := na
+    zoneSbar := na
+
+// Après TP1 : Break-Even + trailing sur le reste
+if strategy.position_size > 0
+    entryP = strategy.position_avg_price
+    if high >= entryP + riskDist * tp1RR
+        stopPrice := math.max(stopPrice, entryP + syminfo.mintick * 10)
+        stopPrice := math.max(stopPrice, close - atrVal * trailMult)
+
+if strategy.position_size < 0
+    entryP = strategy.position_avg_price
+    if low <= entryP - riskDist * tp1RR
+        stopPrice := math.min(stopPrice, entryP - syminfo.mintick * 10)
+        stopPrice := math.min(stopPrice, close + atrVal * trailMult)
+
+if strategy.position_size > 0
+    strategy.exit("TP1-A", from_entry = "ACHAT", qty_percent = tp1Pct, stop = stopPrice, limit = tp1Price, alert_message = '{"bot":"GOLD_LIVE","action":"tp1_buy","symbol":"' + syminfo.ticker + '"}')
+    strategy.exit("TP2-A", from_entry = "ACHAT", qty_percent = 100, stop = stopPrice, limit = tp2Price, alert_message = '{"bot":"GOLD_LIVE","action":"close_buy","symbol":"' + syminfo.ticker + '"}')
+if strategy.position_size < 0
+    strategy.exit("TP1-V", from_entry = "VENTE", qty_percent = tp1Pct, stop = stopPrice, limit = tp1Price, alert_message = '{"bot":"GOLD_LIVE","action":"tp1_sell","symbol":"' + syminfo.ticker + '"}')
+    strategy.exit("TP2-V", from_entry = "VENTE", qty_percent = 100, stop = stopPrice, limit = tp2Price, alert_message = '{"bot":"GOLD_LIVE","action":"close_sell","symbol":"' + syminfo.ticker + '"}')
+
+// ═══════════════ SUPPORTS / RÉSISTANCES (annoncés en direct) ════════════════
+var array<line>  resLines = array.new<line>()
+var array<float> resLvls  = array.new<float>()
+var array<line>  supLines = array.new<line>()
+var array<float> supLvls  = array.new<float>()
+
+phSR  = ta.pivothigh(high, pivSR, pivSR)
+plSR  = ta.pivotlow(low, pivSR, pivSR)
+
+if showSR and not na(phSR)
+    l = line.new(bar_index - pivSR, phSR, bar_index, phSR, extend = extend.right, color = color.new(color.red, 25), width = 2)
+    array.push(resLines, l)
+    array.push(resLvls, phSR)
+    if array.size(resLines) > maxSR
+        line.delete(array.shift(resLines))
+        array.shift(resLvls)
+
+if showSR and not na(plSR)
+    l = line.new(bar_index - pivSR, plSR, bar_index, plSR, extend = extend.right, color = color.new(color.green, 25), width = 2)
+    array.push(supLines, l)
+    array.push(supLvls, plSR)
+    if array.size(supLines) > maxSR
+        line.delete(array.shift(supLines))
+        array.shift(supLvls)
+
+if array.size(resLvls) > 0
+    for i = array.size(resLvls) - 1 to 0
+        lvl = array.get(resLvls, i)
+        ln  = array.get(resLines, i)
+        if close > lvl
+            line.set_extend(ln, extend.none)
+            line.set_x2(ln, bar_index)
+            line.set_color(ln, color.new(color.gray, 75))
+            line.set_style(ln, line.style_dashed)
+            array.remove(resLines, i)
+            array.remove(resLvls, i)
+            lastEvt := "Résistance cassée"
+            lastEvtBar := bar_index
+            sayEvent("🔓 RÉSISTANCE CASSÉE à " + str.tostring(lvl, format.mintick))
+        else if high >= lvl and low <= lvl and not (high[1] >= lvl and low[1] <= lvl)
+            sayEvent("🔴 Le prix touche la RÉSISTANCE " + str.tostring(lvl, format.mintick))
+
+if array.size(supLvls) > 0
+    for i = array.size(supLvls) - 1 to 0
+        lvl = array.get(supLvls, i)
+        ln  = array.get(supLines, i)
+        if close < lvl
+            line.set_extend(ln, extend.none)
+            line.set_x2(ln, bar_index)
+            line.set_color(ln, color.new(color.gray, 75))
+            line.set_style(ln, line.style_dashed)
+            array.remove(supLines, i)
+            array.remove(supLvls, i)
+            lastEvt := "Support cassé"
+            lastEvtBar := bar_index
+            sayEvent("🔓 SUPPORT CASSÉ à " + str.tostring(lvl, format.mintick))
+        else if high >= lvl and low <= lvl and not (high[1] >= lvl and low[1] <= lvl)
+            sayEvent("🟢 Le prix touche le SUPPORT " + str.tostring(lvl, format.mintick))
+
+// ═══════════════ ASIA HIGH / ASIA LOW ═══════════════════════════════════════
+inAsia    = showAsia and not na(time(timeframe.period, asiaSess, "UTC"))
+asiaStart = inAsia and not inAsia[1]
+
+var float aHigh = na
+var float aLow  = na
+var line  aHiLn = na
+var line  aLoLn = na
+var label aHiLb = na
+var label aLoLb = na
+
+if asiaStart
+    line.delete(aHiLn)
+    line.delete(aLoLn)
+    label.delete(aHiLb)
+    label.delete(aLoLb)
+    aHigh := high
+    aLow  := low
+    aHiLn := line.new(bar_index, high, bar_index, high, color = color.new(color.yellow, 0), width = 2)
+    aLoLn := line.new(bar_index, low,  bar_index, low,  color = color.new(color.yellow, 0), width = 2)
+    aHiLb := label.new(bar_index, high, "ASIA HIGH", style = label.style_label_left, color = color.new(color.yellow, 20), textcolor = color.black, size = size.small)
+    aLoLb := label.new(bar_index, low,  "ASIA LOW",  style = label.style_label_left, color = color.new(color.yellow, 20), textcolor = color.black, size = size.small)
+
+if inAsia and not na(aHiLn)
+    aHigh := math.max(aHigh, high)
+    aLow  := math.min(aLow, low)
+    line.set_y1(aHiLn, aHigh)
+    line.set_y2(aHiLn, aHigh)
+    line.set_y1(aLoLn, aLow)
+    line.set_y2(aLoLn, aLow)
+    label.set_y(aHiLb, aHigh)
+    label.set_y(aLoLb, aLow)
+
+if not na(aHiLn)
+    line.set_x2(aHiLn, bar_index)
+    line.set_x2(aLoLn, bar_index)
+    label.set_x(aHiLb, bar_index)
+    label.set_x(aLoLb, bar_index)
+    label.set_text(aHiLb, "ASIA HIGH " + str.tostring(aHigh, format.mintick))
+    label.set_text(aLoLb, "ASIA LOW " + str.tostring(aLow, format.mintick))
+
+if not inAsia and not na(aHigh)
+    if high >= aHigh and high[1] < aHigh
+        lastEvt := "Le prix chasse le ASIA HIGH"
+        lastEvtBar := bar_index
+        sayEvent("⭐ Le prix vient CHERCHER le ASIA HIGH " + str.tostring(aHigh, format.mintick) + " (liquidité)")
+    if low <= aLow and low[1] > aLow
+        lastEvt := "Le prix chasse le ASIA LOW"
+        lastEvtBar := bar_index
+        sayEvent("⭐ Le prix vient CHERCHER le ASIA LOW " + str.tostring(aLow, format.mintick) + " (liquidité)")
+
+// ─────────────────────────── LIGNES DE POSITION ─────────────────────────────
+plot(strategy.position_size != 0 ? stopPrice : na, "Stop Loss", color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size != 0 ? tp1Price  : na, "TP1",       color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size != 0 ? tp2Price  : na, "TP2",       color = color.new(color.teal, 0),  style = plot.style_linebr, linewidth = 2)
+
+bgcolor(inAsia ? color.new(color.yellow, 94) : na, title = "Session Asie")
+bgcolor(dailyLossHit ? color.new(color.red, 88) : na, title = "Coupe-circuit journalier")
+
+// ═══════════════ LE PANNEAU TEMPS RÉEL (coin haut droit) ════════════════════
+var table dash = table.new(position.top_right, 2, 10, bgcolor = color.new(color.black, 10), border_width = 1, border_color = color.new(color.gray, 55))
+ck(bool v) => v ? "✔" : "✘"
+ckCol(bool v) => v ? color.green : color.new(color.gray, 45)
+if barstate.islast
+    structTxt = trend == 1 ? "HAUSSIER ↑" : trend == -1 ? "BAISSIER ↓" : "EN ATTENTE"
+    structCol = trend == 1 ? color.green : trend == -1 ? color.red : color.gray
+    agoTxt    = na(lastEvtBar) ? "" : " (il y a " + str.tostring(bar_index - lastEvtBar) + " bougies)"
+    sweepOk = trend == 1 ? confSweepL : trend == -1 ? confSweepS : false
+    zoneOk  = trend == 1 ? confZoneL : trend == -1 ? confZoneS : false
+    trigOk  = trend == 1 ? triggerBull : trend == -1 ? triggerBear : false
+    trigTxt = trend == 1 ? (triggerBull ? triggerBullTxt : "✘ pas encore") : trend == -1 ? (triggerBear ? triggerBearTxt : "✘ pas encore") : "—"
+    nExtra  = trend == 1 ? extraL : trend == -1 ? extraS : 0
+    ready   = trend != 0 and trigOk and nExtra >= minExtra
+    table.cell(dash, 0, 0, "GOLD LIVE 15M", text_color = color.yellow, text_size = size.small)
+    table.cell(dash, 1, 0, structTxt, text_color = structCol, text_size = size.normal)
+    table.cell(dash, 0, 1, "⚡ Dernier événement", text_color = color.aqua, text_size = size.tiny)
+    table.cell(dash, 1, 1, lastEvt + agoTxt, text_color = color.aqua, text_size = size.tiny)
+    table.cell(dash, 0, 2, "① Structure", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 2, ck(trend != 0), text_color = ckCol(trend != 0), text_size = size.small)
+    table.cell(dash, 0, 3, "② Sweep liquidité", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 3, ck(sweepOk), text_color = ckCol(sweepOk), text_size = size.small)
+    table.cell(dash, 0, 4, "③ Zone OB/FVG respectée", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 4, ck(zoneOk), text_color = ckCol(zoneOk), text_size = size.small)
+    table.cell(dash, 0, 5, "④ La bonne bougie", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 5, trigTxt, text_color = ckCol(trigOk), text_size = size.tiny)
+    table.cell(dash, 0, 6, "⑤ Volume fort", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 6, ck(volOK), text_color = ckCol(volOK), text_size = size.small)
+    table.cell(dash, 0, 7, "VERDICT", text_color = color.yellow, text_size = size.tiny)
+    table.cell(dash, 1, 7, ready ? (trend == 1 ? "TOUT SE RESPECTE → ACHAT" : "TOUT SE RESPECTE → VENTE") : "ON ATTEND", text_color = ready ? (trend == 1 ? color.green : color.red) : color.gray, text_size = size.small)
+    tgtTxt = strategy.position_size != 0 ? "TP1 " + str.tostring(tp1Price, format.mintick) + " → TP2 " + str.tostring(tp2Price, format.mintick) : "affichés dès l'entrée"
+    table.cell(dash, 0, 8, "Objectifs", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 8, tgtTxt, text_color = strategy.position_size != 0 ? color.teal : color.gray, text_size = size.tiny)
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+    table.cell(dash, 0, 9, "Réussite / PF / Trades jour", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 9, str.tostring(winRate, "#.#") + " % / " + str.tostring(pf, "#.##") + " / " + str.tostring(tradesToday) + "-" + str.tostring(maxPerDay), text_color = pf >= 1.3 ? color.green : color.orange, text_size = size.tiny)
